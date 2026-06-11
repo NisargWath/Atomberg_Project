@@ -596,3 +596,118 @@ def build_hierarchy(items: list) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 # 10.  Main pipeline
 # ────────────────────────────────────────
+
+─────────────────────────────────────────────────────────────────────────────
+
+def run_cleaner(raw: list) -> dict:
+    """
+    Full pipeline: raw extracted lines → structured document dict.
+    """
+
+    # ── Step A: Compute body font median for relative heading detection ──
+    body_font_median = compute_body_font_median(raw)
+
+    # ── Step B: Title extraction ──
+    title = merge_title_lines(raw, body_font_median)
+
+    # ── Step C: Metadata extraction ──
+    metadata = extract_metadata(raw, title)
+
+    # ── Step D: Classify each line (noise / heading / paragraph) ──
+    # Build set of exact title constituent texts to skip in the section loop.
+    # Only skip page-1 lines whose font size equals the max title font size
+    # (so ABSTRACT at a smaller size is NOT accidentally skipped).
+    title_line_texts: set[str] = set()
+    if title:
+        page1_items = [x for x in raw if x.get("page") == 1]
+        max_fs = max((x.get("font_size", 0) for x in page1_items), default=0)
+        TITLE_FS_TOL = 1.5
+        for item in raw:
+            t = normalize_text(item.get("text", ""))
+            fs = item.get("font_size", 0)
+            if (
+                t and item.get("page") == 1
+                and abs(fs - max_fs) <= TITLE_FS_TOL
+                and t in title
+                and len(t) > 5
+            ):
+                title_line_texts.add(t)
+
+    classified = []
+    for item in raw:
+        text = normalize_text(item.get("text", ""))
+
+        if not text or is_noise(text):
+            continue
+
+        # Skip lines that were merged into the document title
+        if text in title_line_texts:
+            continue
+
+        is_head, level = detect_heading(item, body_font_median)
+
+        if is_head:
+            classified.append({
+                "type": "heading",
+                "text": text,
+                "level": level if level else 1,
+                "page": item.get("page"),
+            })
+        else:
+            classified.append({
+                "type": "paragraph",
+                "text": text,
+                "page": item.get("page"),
+            })
+
+    # ── Step E: Merge split headings (e.g. "B.1" + "METHODOLOGY") ──
+    classified = merge_split_headings(classified)
+
+    # ── Step F: Merge consecutive paragraph lines into blocks ──
+    merged = merge_paragraphs(classified)
+
+    # ── Step G: Build nested section tree ──
+    sections = build_hierarchy(merged)
+
+    return {
+        "title": title,
+        "metadata": metadata,
+        "sections": sections,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11.  CLI entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Structure-aware cleaner: raw PDF JSON → hierarchical document JSON"
+    )
+    parser.add_argument(
+        "--input", "-i",
+        default="pdf_structure.json",
+        help="Path to raw extracted JSON (default: pdf_structure.json)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default="document_structure.json",
+        help="Path for cleaned output JSON (default: document_structure.json)",
+    )
+    args = parser.parse_args()
+
+    raw = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    result = run_cleaner(raw)
+
+    Path(args.output).write_text(
+        json.dumps(result, indent=4, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"✓  Saved structured document → {args.output}")
+    print(f"   Title    : {result['title'][:80]}")
+    print(f"   Authors  : {len(result['metadata']['authors'])} found")
+    print(f"   Sections : {len(result['sections'])} top-level")
+
+
+if __name__ == "__main__":
+    main()
