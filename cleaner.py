@@ -367,50 +367,54 @@ def merge_title_lines(raw: list, body_font_median: float) -> str:
     """
     Extract and merge the document title from the top of page 1.
 
-    Rules:
-    • Only look at page 1.
-    • Walk lines in order; stop as soon as we hit an author line, affiliation
-      line, email, or a section-stop keyword (ABSTRACT / INTRODUCTION).
-    • Among the lines before that stop point, collect those whose font size
-      is within 1.5pt of the page-1 maximum.
-    • Join them as the title.
-    """
-    page1 = [
-        item for item in raw
-        if item.get("page") == 1
-    ]
+    Key fix: compute max_fs from the pre-abstract zone ONLY, not all of page 1.
+    Previously, large fonts elsewhere on page 1 (section headings after ABSTRACT)
+    raised the max_fs bar so the actual title lines didn't qualify.
 
+    Steps:
+    1. Walk page-1 lines in order; stop at author/affiliation/email or ABSTRACT.
+    2. Compute max_fs from that zone only.
+    3. Collect lines within TITLE_FS_TOL of that zone max → these are the title.
+    4. Fallback: if no font info, take first 1-3 non-trivial lines.
+    """
+    page1 = [item for item in raw if item.get("page") == 1]
     if not page1:
         return ""
 
-    max_fs = max((item.get("font_size", 0) for item in page1), default=0)
-
-    # Walk page 1 in order, collecting pre-abstract lines
+    # Step 1: pre-abstract zone
     pre_abstract = []
     for item in page1:
         t = normalize_text(item.get("text", ""))
         if not t or is_noise(t):
             continue
-
-        # Stop collecting when we reach a section boundary
         if _is_section_stop(t):
             break
         if is_author_line(t) or is_affiliation_line(t) or is_email(t):
             break
-
         pre_abstract.append(item)
 
     if not pre_abstract:
         return ""
 
-    # From those pre-abstract lines, pick the ones with the largest font size
+    # Step 2: max font size within zone (NOT from all of page 1)
+    zone_max_fs = max((item.get("font_size", 0) for item in pre_abstract), default=0)
+
+    # Step 3: collect title lines
     TITLE_FS_TOL = 1.5
-    title_lines = [
-        normalize_text(item["text"])
-        for item in pre_abstract
-        if abs(item.get("font_size", 0) - max_fs) <= TITLE_FS_TOL
-        and len(normalize_text(item["text"])) > 3
-    ]
+    if zone_max_fs > 0:
+        title_lines = [
+            normalize_text(item["text"])
+            for item in pre_abstract
+            if abs(item.get("font_size", 0) - zone_max_fs) <= TITLE_FS_TOL
+            and len(normalize_text(item["text"])) > 3
+        ]
+    else:
+        # Fallback: no font size info, take first 1-3 lines
+        title_lines = [
+            normalize_text(item["text"])
+            for item in pre_abstract[:3]
+            if len(normalize_text(item["text"])) > 3
+        ]
 
     return " ".join(title_lines).strip()
 
@@ -423,9 +427,9 @@ def extract_metadata(raw: list, title: str) -> dict:
     """
     Extract authors, affiliation, emails, and source.
 
-    Scans only page 1 in order.
-    Skips title lines (matched by font size + text).
-    Stops at the first section-stop keyword (ABSTRACT / INTRODUCTION).
+    Scans page 1 in order.  Stops at ABSTRACT / INTRODUCTION.
+    Skips title lines by matching text content (not font size) — simpler and
+    more reliable now that title extraction is correct.
     """
     metadata = {
         "authors": [],
@@ -436,18 +440,17 @@ def extract_metadata(raw: list, title: str) -> dict:
 
     page1 = [item for item in raw if item.get("page") == 1]
 
-    # Determine title font size range so we can skip title lines
-    max_fs = max((x.get("font_size", 0) for x in page1), default=0)
-    TITLE_FS_TOL = 1.5
-
-    def _is_title_line(item) -> bool:
-        t = normalize_text(item.get("text", ""))
-        fs = item.get("font_size", 0)
-        return (
-            abs(fs - max_fs) <= TITLE_FS_TOL
-            and t in title
-            and len(t) > 5
-        )
+    # Build a set of title constituent texts for fast skip lookup
+    title_texts: set[str] = set()
+    if title:
+        # Each part of a joined title may be a separate line; split on common join
+        for chunk in title.split("  "):   # double-space unlikely in title
+            title_texts.add(chunk.strip())
+        # Also add exact substrings that appear as line-length segments
+        for item in page1:
+            t = normalize_text(item.get("text", ""))
+            if t and len(t) > 5 and t in title:
+                title_texts.add(t)
 
     for item in page1:
         t = normalize_text(item.get("text", ""))
@@ -458,8 +461,8 @@ def extract_metadata(raw: list, title: str) -> dict:
         if _is_section_stop(t):
             break
 
-        # Skip title lines
-        if _is_title_line(item):
+        # Skip title constituent lines
+        if t in title_texts:
             continue
 
         if is_email(t):
@@ -607,17 +610,16 @@ def run_cleaner(raw: list) -> dict:
     # C: metadata — page-1 zone between title and ABSTRACT
     metadata = extract_metadata(raw, title)
 
-    # D: build set of title-constituent texts so we don't re-emit them as headings
-    page1_items = [x for x in raw if x.get("page") == 1]
-    max_fs_p1   = max((x.get("font_size", 0) for x in page1_items), default=0)
-    TITLE_FS_TOL = 1.5
-    title_line_texts: set[str] = {
-        normalize_text(x["text"])
-        for x in page1_items
-        if abs(x.get("font_size", 0) - max_fs_p1) <= TITLE_FS_TOL
-        and normalize_text(x.get("text", "")) in title
-        and len(normalize_text(x.get("text", ""))) > 5
-    }
+    # D: build set of title-constituent texts so we don't re-emit them as headings.
+    # Match by text content only — simpler and immune to font-size edge cases.
+    title_line_texts: set[str] = set()
+    if title:
+        for item in raw:
+            if item.get("page") != 1:
+                continue
+            t = normalize_text(item.get("text", ""))
+            if t and len(t) > 5 and t in title:
+                title_line_texts.add(t)
 
     # E: classify every line
     classified = []
@@ -659,25 +661,54 @@ def run_cleaner(raw: list) -> dict:
 # 12.  CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+def debug_page1(raw: list) -> None:
+    """Print page-1 lines with font sizes — helps diagnose title/metadata issues."""
+    print("\n=== DEBUG: page-1 lines (font_size | text) ===")
+    page1 = [x for x in raw if x.get("page") == 1]
+    for item in page1:
+        t  = normalize_text(item.get("text", ""))
+        fs = item.get("font_size", 0)
+        if not t:
+            continue
+        tag = ""
+        if _is_section_stop(t):       tag = "  [SECTION STOP]"
+        elif is_author_line(t):       tag = "  [AUTHOR LINE]"
+        elif is_affiliation_line(t):  tag = "  [AFFILIATION]"
+        elif is_email(t):             tag = "  [EMAIL]"
+        elif is_noise(t):             tag = "  [NOISE]"
+        print(f"  {fs:6.2f}pt  {t[:80]}{tag}")
+    body_med = compute_body_font_median(raw)
+    print(f"\n  body_font_median = {body_med:.2f}pt")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Structure-aware cleaner: raw PDF JSON → hierarchical document JSON"
+        description="Structure-aware cleaner: raw PDF JSON -> hierarchical document JSON"
     )
     parser.add_argument("--input",  "-i", default="pdf_structure.json")
     parser.add_argument("--output", "-o", default="document_structure.json")
+    parser.add_argument(
+        "--debug", "-d", action="store_true",
+        help="Print page-1 font sizes to diagnose title/metadata issues",
+    )
     args = parser.parse_args()
 
-    raw    = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    raw = json.loads(Path(args.input).read_text(encoding="utf-8"))
+
+    if args.debug:
+        debug_page1(raw)
+
     result = run_cleaner(raw)
 
     Path(args.output).write_text(
         json.dumps(result, indent=4, ensure_ascii=False), encoding="utf-8"
     )
-    print(f"✓  Saved → {args.output}")
-    print(f"   Title    : {result['title'][:80]}")
+    title_display = result["title"][:80] if result["title"] else "(empty — run with --debug to diagnose)"
+    print(f"\u2713  Saved \u2192 {args.output}")
+    print(f"   Title    : {title_display}")
     print(f"   Authors  : {len(result['metadata']['authors'])} found")
     print(f"   Sections : {len(result['sections'])} top-level")
-
 
 if __name__ == "__main__":
     main()
