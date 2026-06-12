@@ -1,4 +1,3 @@
-"""
 cleaner.py  —  Structure-Aware Post-Processor for PDF Extraction
 ================================================================
 Reads raw line-level JSON produced by a PyMuPDF extractor and outputs
