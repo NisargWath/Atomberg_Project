@@ -1,61 +1,85 @@
+"""
 cleaner.py  —  Structure-Aware Post-Processor for PDF Extraction
 ================================================================
-Reads raw line-level JSON produced by a PyMuPDF extractor and outputs
-a hierarchical document JSON ready for structure-aware chunking.
-
 Pipeline:
-  raw JSON  →  normalize  →  noise filter  →  body-font computation
-            →  title extraction (page-1 top zone, stops at ABSTRACT)
-            →  metadata extraction (page-1 zone between title and ABSTRACT)
-            →  line classification (heading / paragraph)
-            →  split-heading merge  →  paragraph merge
-            →  hierarchy tree build  →  final JSON
+  raw JSON  →  normalize  →  repeated header/footer removal (NEW)
+            →  noise filter  →  false-heading filter (IMPROVED)
+            →  body-font computation
+            →  title extraction  →  metadata extraction
+            →  line classification  →  split-heading merge
+            →  paragraph merge  →  hierarchy tree build
+            →  references separated (NEW)  →  final JSON
+
+Changes vs previous version
+────────────────────────────
+  [1] False-heading filter: table values, unit lines, numeric-only lines,
+      repeated column headers now rejected before heading detection.
+  [2] Subsection detection: isolated title-like lines and numbered subsection
+      patterns separated from body text more reliably.
+  [3] Repeated page header/footer removal: lines appearing on 3+ pages at
+      the same vertical position (or identical text) stripped before hierarchy.
+  [6] References section separated into its own top-level key, not mixed
+      into the retrieval sections list.
 
 Usage:
   python cleaner.py --input pdf_structure.json --output document_structure.json
+  python cleaner.py --input pdf_structure.json --output document_structure.json --debug
 """
 
 import json
 import re
 import argparse
+from collections import Counter
 from pathlib import Path
 from statistics import median
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 0.  Config / tuneable constants
+# 0.  Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Font size must be >= (body_median * ratio) to be a heading candidate via size.
-HEADING_FONT_RATIO = 1.10
+HEADING_FONT_RATIO   = 1.10   # min font-size ratio over body median → heading
+MAX_HEADING_WORDS    = 14     # hard cap on heading word count
+MIN_PARAGRAPH_WORDS  = 2      # min words to keep a paragraph block
 
-# Hard cap on word count for any heading.
-MAX_HEADING_WORDS = 14
+# A line is a repeated header/footer if it appears on >= this many pages.
+REPEATED_LINE_PAGE_THRESHOLD = 3
 
-# Minimum words needed to keep a paragraph block (filters isolated stray tokens).
-MIN_PARAGRAPH_WORDS = 2
-
-# Section-boundary keywords used as stop-signals during title/metadata scanning.
 _SECTION_STOPS = {
     "abstract", "introduction", "related work", "background",
     "preliminaries", "methods", "methodology", "experiments",
     "conclusion", "references",
 }
 
-# Words / labels that look like headings but are really table/metric labels.
-# Used in detect_heading() to reject false positives.
+# ── [1] Extended false-heading blacklist ─────────────────────────────────────
+# Covers table column labels, metric names, unit labels, common paragraph
+# openers that get promoted by font-size heuristic on some PDFs.
 _FAKE_HEADING_WORDS = {
-    "model", "retriever", "dataset", "configuration",
+    # Table / result labels
+    "model", "retriever", "dataset", "configuration", "baseline",
+    "system", "systems", "comparison", "setup", "setting", "settings",
+    "task", "tasks", "category", "categories", "type", "types",
+    "input", "output", "size", "name", "role", "layer", "question",
+    "content", "value", "values", "score", "scores",
+    # Metric names
     "accuracy", "rouge", "rouge-l", "rouge-1", "rouge-2",
-    "bleu", "bleu-1", "bleu-4", "meteor", "bm25", "dpr",
-    "sbert", "qasper", "quality", "narrativeqa",
-    "url", "layer", "question", "content", "role",
-    "comparison", "systems", "to", "and", "or", "the",
-    "score", "scores", "value", "values", "type", "types",
-    "input", "output", "size", "name", "method", "methods",
+    "bleu", "bleu-1", "bleu-4", "meteor", "f1", "ndcg", "map", "mrr",
+    "recall", "precision", "perplexity",
+    # Model/dataset names used as column headers
+    "bm25", "dpr", "sbert", "qasper", "narrativeqa", "quality",
+    "bert", "gpt", "t5", "bart", "llama", "mistral",
+    # Stopwords that slip through
+    "to", "and", "or", "the", "of", "in", "on", "at", "by", "for",
+    "with", "from", "that", "this", "it", "is", "are", "was",
 }
 
-# Single-word ALL-CAPS lines are only headings if they are one of these.
+# Unit patterns — lines like "ms", "GB", "tokens/s" must not be headings
+_UNIT_PATTERN = re.compile(
+    r"^[\d.,\s]*(ms|s|sec|min|hr|gb|mb|kb|tokens?|words?|chars?|"
+    r"bytes?|fps|hz|khz|mhz|ghz|mm|cm|m|km|°c|°f|%|k|m|b|t)\s*$",
+    re.IGNORECASE,
+)
+
 _KNOWN_SINGLE_HEADINGS = {
     "abstract", "introduction", "background", "preliminaries",
     "methods", "methodology", "approach", "model",
@@ -65,12 +89,16 @@ _KNOWN_SINGLE_HEADINGS = {
     "appendix", "supplementary", "checklist",
 }
 
-# Metric / acronym tokens that must never become headings.
 _METRIC_ACRONYMS = {
     "bm25", "dpr", "bleu", "rouge", "meteor", "f1", "pk", "wd",
     "ndcg", "map", "mrr", "recall", "precision", "accuracy",
     "url", "uri", "api", "gpu", "cpu", "ram", "llm", "rag",
     "sbert", "bert", "gpt", "t5", "bart",
+}
+
+# Heading keywords that signal the References section (any case)
+_REFERENCE_HEADINGS = {
+    "references", "bibliography", "works cited", "citations",
 }
 
 
@@ -79,7 +107,6 @@ _METRIC_ACRONYMS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_text(text: str) -> str:
-    """Collapse unicode whitespace, non-breaking spaces, and control chars."""
     text = text.replace("\u00a0", " ").replace("\t", " ")
     text = re.sub(r"[\x00-\x1f\x7f]", "", text)
     text = re.sub(r" {2,}", " ", text)
@@ -110,17 +137,17 @@ _NOISE_PATTERNS = [
 
 
 def is_noise(text: str) -> bool:
-    """Return True if this line should be discarded entirely."""
     t = text.strip()
     if not t:
         return True
     if len(t) <= 2 and not t.isalpha():
         return True
-    # Pure numeric / percentage tokens  →  35.3  57.9%  .28  6.7
     if re.fullmatch(r"[\d\s.,%±~<>≤≥]+", t):
         return True
-    # Lone superscript / footnote markers  →  ∗  †  1,2
     if re.fullmatch(r"[∗†‡§¶*†,\d\s]{1,6}", t):
+        return True
+    # [1] Unit-based lines  →  "42 ms", "3.2 GB"
+    if _UNIT_PATTERN.match(t):
         return True
     for pat in _NOISE_PATTERNS:
         if pat.search(t):
@@ -133,7 +160,6 @@ def is_email(text: str) -> bool:
 
 
 def is_author_line(text: str) -> bool:
-    """Heuristic: comma-separated names — at least 2 commas, mostly title-case."""
     if text.count(",") < 2:
         return False
     words = text.replace(",", " ").split()
@@ -147,12 +173,10 @@ def is_affiliation_line(text: str) -> bool:
         "school of", "department of", "dept.", "faculty of",
         "research center", "research centre",
     ]
-    t = text.lower()
-    return any(k in t for k in keywords)
+    return any(k in text.lower() for k in keywords)
 
 
 def is_caption_like(text: str) -> bool:
-    """Figure / Table / Algorithm captions must NOT become headings."""
     patterns = [
         r"^(Figure|Fig\.?)\s+\d+",
         r"^Table\s+\d+",
@@ -164,18 +188,69 @@ def is_caption_like(text: str) -> bool:
 
 
 def _is_section_stop(text: str) -> bool:
-    """Return True if this text signals the start of the body (ABSTRACT etc.)."""
     return text.lower().strip(".") in _SECTION_STOPS
 
 
+def _is_reference_heading(text: str) -> bool:
+    return text.lower().strip().rstrip(".") in _REFERENCE_HEADINGS
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Heading detection helpers
+# 3.  [NEW] Repeated page header / footer removal
+# ─────────────────────────────────────────────────────────────────────────────
+
+def remove_repeated_headers_footers(raw: list) -> list:
+    """
+    [Requirement 3] Remove lines that appear verbatim on 3 or more distinct
+    pages — these are running headers or footers (journal name, paper title
+    repeated in header, page footer text, etc.).
+
+    Strategy:
+    - Count how many distinct pages each normalized text appears on.
+    - Any text appearing on >= REPEATED_LINE_PAGE_THRESHOLD pages is a
+      header/footer candidate.
+    - Extra guard: only suppress if the line is SHORT (≤ 10 words) to avoid
+      accidentally removing repeated legitimate sentences in a survey paper.
+    """
+    # Map: normalized_text → set of page numbers it appears on
+    text_pages: dict[str, set] = {}
+    for item in raw:
+        t = normalize_text(item.get("text", ""))
+        p = item.get("page")
+        if t and p is not None:
+            text_pages.setdefault(t, set()).add(p)
+
+    # Build suppression set: short lines on 3+ pages
+    suppressed: set[str] = {
+        t for t, pages in text_pages.items()
+        if len(pages) >= REPEATED_LINE_PAGE_THRESHOLD
+        and len(t.split()) <= 10
+    }
+
+    if suppressed:
+        # Keep first occurrence only (it may be the actual section heading)
+        seen: set[str] = set()
+        filtered = []
+        for item in raw:
+            t = normalize_text(item.get("text", ""))
+            if t in suppressed:
+                if t not in seen:
+                    seen.add(t)
+                    filtered.append(item)  # keep first occurrence
+                # subsequent occurrences → silently dropped
+            else:
+                filtered.append(item)
+        return filtered
+
+    return raw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  Heading detection helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _numbered_heading_level(text: str):
-    """
-    1 Introduction → 1   |   2.1 Querying → 2   |   3.2.1 Results → 3
-    """
+    """1 Intro → 1  |  2.1 Methods → 2  |  3.2.1 Results → 3"""
     m = re.match(r"^(\d+(?:\.\d+)*)\s{1,4}[A-Z\u00C0-\u024F]", text)
     if not m:
         return None
@@ -183,14 +258,11 @@ def _numbered_heading_level(text: str):
 
 
 def _appendix_heading_level(text: str):
-    """
-    A ABLATION STUDY → 1  |  B.1 METHODOLOGY → 2  |  E.2 FINDINGS → 2
-    """
+    """A Ablation → 1  |  B.1 Methodology → 2  |  E.2 Findings → 2"""
     m = re.match(r"^([A-Z](?:\.\d+)*)\s{1,4}(\S.{0,80})$", text)
     if not m:
         return None
-    prefix = m.group(1)
-    rest   = m.group(2)
+    prefix, rest = m.group(1), m.group(2)
     if not rest[0].isupper():
         return None
     if rest.lower().strip(".") in _METRIC_ACRONYMS:
@@ -199,17 +271,11 @@ def _appendix_heading_level(text: str):
 
 
 def _is_bare_section_prefix(text: str) -> bool:
-    """
-    Return True for lone numbering tokens like "B.1", "3.2", "A".
-    These are the first half of a split heading and must be merged.
-    """
+    """Return True for lone tokens like "B.1", "3.2" — first half of split heading."""
     return bool(re.fullmatch(r"[A-Z](?:\.\d+)*|\d+(?:\.\d+)*", text.strip()))
 
 
 def _all_caps_heading(text: str) -> bool:
-    """
-    ABSTRACT / INTRODUCTION / RELATED WORK — short ALL-CAPS lines.
-    """
     if text != text.upper():
         return False
     words = text.split()
@@ -217,61 +283,63 @@ def _all_caps_heading(text: str) -> bool:
         return False
     if text.endswith("."):
         return False
-    if re.search(r"\d", text):      # digits in all-caps → risky (table label)
+    if re.search(r"\d", text):
         return False
     if not any(c.isalpha() for c in text):
         return False
-    # Single-word: must be in known list
     if len(words) == 1 and text.lower() not in _KNOWN_SINGLE_HEADINGS:
         return False
     return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  Main heading detector
+# 5.  Main heading detector  (requirements 1 + 2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_heading(item: dict, body_font_median: float):
     """
     Return (is_heading: bool, level: int | None).
 
-    Decision order:
-      Guard 0:  noise / caption → reject
-      Guard 1:  fake-heading blacklist → reject
-      Guard 2:  too many digits without a numbering pattern → reject
-      Guard 3:  contains comma (not a numbered/appendix heading) → reject
-      Guard 4:  single word not in known list → reject
-      Rule  0:  bare prefix ("B.1" alone) → heading (for split-merge)
-      Rule  1:  numbered section (1 / 2.1 / 3.2.1)
-      Rule  2:  appendix letter (A / B.1 / E.2)
-      Rule  3:  canonical section keyword (case-insensitive)
-      Rule  4:  ALL-CAPS short line (with single-word guard)
-      Rule  5:  font-size above body median (conservative)
+    Guard order (all guards before rules to fail fast):
+      G0: noise / caption          → reject
+      G1: fake-heading blacklist   → reject
+      G2: [1] unit-based line      → reject
+      G3: [1] numeric/table-like   → reject
+      G4: comma-containing line    → reject (unless structured number pattern)
+      G5: [2] single-word guard    → reject unless in known list
+
+    Rule order:
+      R0: bare section prefix      → heading (for split-merge)
+      R1: numbered section         → heading
+      R2: appendix letter          → heading
+      R3: [2] titled-case short line with context clues → heading
+      R4: canonical keyword        → heading
+      R5: ALL-CAPS short line      → heading
+      R6: font-size heuristic      → heading (conservative)
     """
     text = normalize_text(item.get("text", ""))
     if not text or is_noise(text):
         return False, None
-
     if is_caption_like(text):
         return False, None
 
     text_lower = text.lower().strip(".")
 
-    # ── Rule 0: bare section prefix → heading so merge_split_headings can join ──
-    # Must come FIRST before the guards, so "B.1" and "3.2" aren't rejected.
+    # ── R0 first: bare prefix must bypass all guards ──
     if _is_bare_section_prefix(text):
-        dots = text.count(".")
-        return True, dots + 1
+        return True, text.count(".") + 1
 
-    # ── Guard 1: fake-heading / table-label blacklist ──
+    # ── G1: fake-heading blacklist ──
     if text_lower in _FAKE_HEADING_WORDS:
         return False, None
 
-    # ── Guard 2: numeric/table-like lines ──
-    # Reject pure numeric/percentage content
-    if re.fullmatch(r"[\d\s,.%±<>≤≥]+", text):
+    # ── G2: [1] unit-based lines ──
+    if _UNIT_PATTERN.match(text):
         return False, None
-    # Reject lines with many digits that don't match a numbered heading pattern
+
+    # ── G3: [1] numeric / table-value lines ──
+    if re.fullmatch(r"[\d\s,.%±<>≤≥\/]+", text):
+        return False, None
     digit_count = sum(c.isdigit() for c in text)
     if (
         digit_count > 3
@@ -280,53 +348,59 @@ def detect_heading(item: dict, body_font_median: float):
     ):
         return False, None
 
-    # ── Guard 3: lines with commas are almost never headings ──
-    # (unless they match a structured pattern like "2.1 Methods, Results")
+    # ── G4: comma-containing lines (almost never headings) ──
     if "," in text:
         if _numbered_heading_level(text) is None and _appendix_heading_level(text) is None:
             return False, None
 
-    # ── Guard 4: single-word lines not in the known section list ──
+    # ── G5: [2] single-word guard ──
     words = text.split()
-    if len(words) == 1 and text_lower not in _KNOWN_SINGLE_HEADINGS and text_lower not in _METRIC_ACRONYMS:
-        # Still allow if it's truly a known section keyword (handled by Rule 3 below)
-        # But disallow generic single-word capitalized labels
-        if not text.isupper() or text_lower not in _KNOWN_SINGLE_HEADINGS:
-            # Only allow if it matches numbered/appendix pattern
-            if _numbered_heading_level(text) is None and _appendix_heading_level(text) is None:
-                return False, None
+    if len(words) == 1:
+        if text_lower not in _KNOWN_SINGLE_HEADINGS:
+            return False, None
 
-    # ── Rule 1: numbered section heading ──
+    # ── R1: numbered section ──
     lvl = _numbered_heading_level(text)
     if lvl is not None:
         return True, lvl
 
-    # ── Rule 2: appendix letter heading ──
+    # ── R2: appendix letter ──
     lvl = _appendix_heading_level(text)
     if lvl is not None:
         return True, lvl
 
-    # ── Rule 3: canonical section keyword (any case) ──
+    # ── R3: [2] title-case short line — improved subsection detection ──
+    # A line is a likely subsection heading if:
+    #   - 2–6 words, title-case (most words capitalised)
+    #   - does NOT end with a period (sentences do; headings don't)
+    #   - NOT in the fake-heading blacklist (already checked above)
+    #   - font size is at least equal to body median
+    if 2 <= len(words) <= 6 and not text.endswith("."):
+        cap_words = sum(1 for w in words if w and w[0].isupper())
+        cap_ratio = cap_words / len(words)
+        font_size = item.get("font_size", 0)
+        if cap_ratio >= 0.7 and font_size >= body_font_median * HEADING_FONT_RATIO:
+            return True, 2   # treat as subsection level
+
+    # ── R4: canonical keyword ──
     if text_lower in _SECTION_STOPS or text_lower in _KNOWN_SINGLE_HEADINGS:
         return True, 1
 
-    # ── Rule 4: ALL-CAPS short line ──
+    # ── R5: ALL-CAPS short line ──
     if _all_caps_heading(text):
         return True, 1
 
-    # ── Rule 5: font-size heuristic (conservative) ──
+    # ── R6: font-size heuristic (conservative) ──
     font_size = item.get("font_size", 0)
-    word_count = len(words)
     if (
         body_font_median > 0
         and font_size >= body_font_median * HEADING_FONT_RATIO
-        and word_count <= MAX_HEADING_WORDS
+        and len(words) <= MAX_HEADING_WORDS
+        and len(words) >= 2
         and not text.endswith(".")
         and not is_email(text)
         and not is_author_line(text)
         and not is_affiliation_line(text)
-        # Extra guard: don't promote lines that look like sentence fragments
-        and word_count >= 2                     # at least two words
         and text_lower not in _FAKE_HEADING_WORDS
     ):
         if font_size >= body_font_median * 1.4:
@@ -339,14 +413,10 @@ def detect_heading(item: dict, body_font_median: float):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  Body font median
+# 6.  Body font median
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_body_font_median(raw: list) -> float:
-    """
-    Compute the dominant body font size, weighted by word count so that
-    long body paragraphs dominate over short heading lines.
-    """
     sizes = []
     for item in raw:
         text = normalize_text(item.get("text", ""))
@@ -359,28 +429,14 @@ def compute_body_font_median(raw: list) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  Title extraction  (FIX: stop at ABSTRACT, use only top zone of page 1)
+# 7.  Title extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def merge_title_lines(raw: list, body_font_median: float) -> str:
-    """
-    Extract and merge the document title from the top of page 1.
-
-    Key fix: compute max_fs from the pre-abstract zone ONLY, not all of page 1.
-    Previously, large fonts elsewhere on page 1 (section headings after ABSTRACT)
-    raised the max_fs bar so the actual title lines didn't qualify.
-
-    Steps:
-    1. Walk page-1 lines in order; stop at author/affiliation/email or ABSTRACT.
-    2. Compute max_fs from that zone only.
-    3. Collect lines within TITLE_FS_TOL of that zone max → these are the title.
-    4. Fallback: if no font info, take first 1-3 non-trivial lines.
-    """
     page1 = [item for item in raw if item.get("page") == 1]
     if not page1:
         return ""
 
-    # Step 1: pre-abstract zone
     pre_abstract = []
     for item in page1:
         t = normalize_text(item.get("text", ""))
@@ -395,11 +451,9 @@ def merge_title_lines(raw: list, body_font_median: float) -> str:
     if not pre_abstract:
         return ""
 
-    # Step 2: max font size within zone (NOT from all of page 1)
     zone_max_fs = max((item.get("font_size", 0) for item in pre_abstract), default=0)
-
-    # Step 3: collect title lines
     TITLE_FS_TOL = 1.5
+
     if zone_max_fs > 0:
         title_lines = [
             normalize_text(item["text"])
@@ -408,7 +462,6 @@ def merge_title_lines(raw: list, body_font_median: float) -> str:
             and len(normalize_text(item["text"])) > 3
         ]
     else:
-        # Fallback: no font size info, take first 1-3 lines
         title_lines = [
             normalize_text(item["text"])
             for item in pre_abstract[:3]
@@ -419,33 +472,15 @@ def merge_title_lines(raw: list, body_font_median: float) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7.  Metadata extraction  (FIX: scan only page-1 zone between title & ABSTRACT)
+# 8.  Metadata extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_metadata(raw: list, title: str) -> dict:
-    """
-    Extract authors, affiliation, emails, and source.
-
-    Scans page 1 in order.  Stops at ABSTRACT / INTRODUCTION.
-    Skips title lines by matching text content (not font size) — simpler and
-    more reliable now that title extraction is correct.
-    """
-    metadata = {
-        "authors": [],
-        "affiliation": "",
-        "emails": [],
-        "source": "",
-    }
-
+    metadata = {"authors": [], "affiliation": "", "emails": [], "source": ""}
     page1 = [item for item in raw if item.get("page") == 1]
 
-    # Build a set of title constituent texts for fast skip lookup
     title_texts: set[str] = set()
     if title:
-        # Each part of a joined title may be a separate line; split on common join
-        for chunk in title.split("  "):   # double-space unlikely in title
-            title_texts.add(chunk.strip())
-        # Also add exact substrings that appear as line-length segments
         for item in page1:
             t = normalize_text(item.get("text", ""))
             if t and len(t) > 5 and t in title:
@@ -455,26 +490,17 @@ def extract_metadata(raw: list, title: str) -> dict:
         t = normalize_text(item.get("text", ""))
         if not t or is_noise(t):
             continue
-
-        # Stop at section body
         if _is_section_stop(t):
             break
-
-        # Skip title constituent lines
         if t in title_texts:
             continue
-
         if is_email(t):
-            found = re.findall(r"[\w.+-]+@[\w.-]+\.\w{2,}", t)
-            metadata["emails"].extend(found)
-
+            metadata["emails"].extend(re.findall(r"[\w.+-]+@[\w.-]+\.\w{2,}", t))
         elif is_author_line(t) and not metadata["authors"]:
             parts = [re.sub(r"[\d∗†‡§¶*,]+$", "", p).strip() for p in t.split(",")]
             metadata["authors"] = [p for p in parts if p]
-
         elif is_affiliation_line(t) and not metadata["affiliation"]:
             metadata["affiliation"] = t
-
         elif re.search(r"arxiv:", t, re.IGNORECASE) and not metadata["source"]:
             metadata["source"] = t
 
@@ -482,60 +508,40 @@ def extract_metadata(raw: list, title: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8.  Split heading merge
+# 9.  Split heading merge
 # ─────────────────────────────────────────────────────────────────────────────
 
 def merge_split_headings(items: list) -> list:
-    """
-    Merge two-line split headings:
-      "B.1" + "METHODOLOGY"  →  "B.1 METHODOLOGY"
-      "E.2" + "FINDINGS"     →  "E.2 FINDINGS"
-
-    Only fires when the first heading is a bare prefix token.
-    """
     if not items:
         return items
-
     merged = []
     i = 0
     while i < len(items):
         item = items[i]
-
         if item.get("type") == "heading" and i + 1 < len(items):
-            current_text = normalize_text(item.get("text", ""))
-            next_item = items[i + 1]
-
-            if _is_bare_section_prefix(current_text) and next_item.get("type") == "heading":
-                next_text = normalize_text(next_item.get("text", ""))
-                combined  = f"{current_text} {next_text}"
+            cur = normalize_text(item.get("text", ""))
+            nxt = items[i + 1]
+            if _is_bare_section_prefix(cur) and nxt.get("type") == "heading":
+                nxt_text = normalize_text(nxt.get("text", ""))
+                combined = f"{cur} {nxt_text}"
                 lvl = (
                     _appendix_heading_level(combined)
                     or _numbered_heading_level(combined)
                     or item.get("level", 1)
                 )
-                merged.append({
-                    **item,
-                    "text": combined,
-                    "level": lvl,
-                })
+                merged.append({**item, "text": combined, "level": lvl})
                 i += 2
                 continue
-
         merged.append(item)
         i += 1
-
     return merged
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9.  Paragraph merging  (unchanged — already correct)
+# 10.  Paragraph merging
 # ─────────────────────────────────────────────────────────────────────────────
 
 def merge_paragraphs(items: list) -> list:
-    """
-    Merge consecutive paragraph lines into single paragraph blocks.
-    Preserves the page number of the first line in each block.
-    """
     merged = []
     buffer_texts = []
     buffer_page  = None
@@ -563,24 +569,20 @@ def merge_paragraphs(items: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10.  Hierarchy tree  (unchanged — already correct)
+# 11.  Hierarchy tree
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_hierarchy(items: list) -> list:
-    """
-    Stack-based nesting: each heading node becomes a child of the nearest
-    ancestor with a strictly lower level number.
-    """
     root = {"heading": "__ROOT__", "level": 0, "page": None, "content": [], "children": []}
     stack = [root]
 
     for item in items:
         if item["type"] == "heading":
             node = {
-                "heading": item["text"],
-                "level":   item.get("level", 1),
-                "page":    item.get("page"),
-                "content": [],
+                "heading":  item["text"],
+                "level":    item.get("level", 1),
+                "page":     item.get("page"),
+                "content":  [],
                 "children": [],
             }
             while len(stack) > 1 and stack[-1]["level"] >= node["level"]:
@@ -594,23 +596,55 @@ def build_hierarchy(items: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 11.  Main pipeline
+# 12.  [NEW] References separation  (requirement 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def separate_references(sections: list) -> tuple[list, list]:
+    """
+    [Requirement 6] Pull the References section (and any sections after it)
+    out of the main sections list and return them separately.
+
+    Returns (main_sections, reference_sections).
+
+    References are kept so they can be stored/searched differently (e.g. a
+    separate FAISS index, BM25 lookup, or just metadata) rather than polluting
+    the main semantic retrieval index.
+    """
+    main: list = []
+    refs: list = []
+    in_refs = False
+
+    for section in sections:
+        if _is_reference_heading(section.get("heading", "")):
+            in_refs = True
+        if in_refs:
+            refs.append(section)
+        else:
+            main.append(section)
+
+    return main, refs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13.  Main pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_cleaner(raw: list) -> dict:
     """Full pipeline: raw extracted lines → structured document dict."""
 
-    # A: body font median (used by detect_heading for relative size comparison)
+    # A: [3] Remove repeated page headers / footers before anything else
+    raw = remove_repeated_headers_footers(raw)
+
+    # B: body font median
     body_font_median = compute_body_font_median(raw)
 
-    # B: title — top of page 1, stops at ABSTRACT
+    # C: title
     title = merge_title_lines(raw, body_font_median)
 
-    # C: metadata — page-1 zone between title and ABSTRACT
+    # D: metadata
     metadata = extract_metadata(raw, title)
 
-    # D: build set of title-constituent texts so we don't re-emit them as headings.
-    # Match by text content only — simpler and immune to font-size edge cases.
+    # E: title-line suppression set
     title_line_texts: set[str] = set()
     if title:
         for item in raw:
@@ -620,14 +654,14 @@ def run_cleaner(raw: list) -> dict:
             if t and len(t) > 5 and t in title:
                 title_line_texts.add(t)
 
-    # E: classify every line
+    # F: classify every line
     classified = []
     for item in raw:
         text = normalize_text(item.get("text", ""))
         if not text or is_noise(text):
             continue
         if text in title_line_texts:
-            continue   # already consumed as title
+            continue
 
         is_head, level = detect_heading(item, body_font_median)
         if is_head:
@@ -644,25 +678,32 @@ def run_cleaner(raw: list) -> dict:
                 "page": item.get("page"),
             })
 
-    # F: merge split headings ("B.1" + "METHODOLOGY" → "B.1 METHODOLOGY")
+    # G: merge split headings
     classified = merge_split_headings(classified)
 
-    # G: merge consecutive paragraph lines into blocks
+    # H: merge paragraph lines into blocks
     merged = merge_paragraphs(classified)
 
-    # H: build nested section tree
+    # I: build hierarchy
     sections = build_hierarchy(merged)
 
-    return {"title": title, "metadata": metadata, "sections": sections}
+    # J: [6] separate references
+    main_sections, ref_sections = separate_references(sections)
+
+    return {
+        "title":      title,
+        "metadata":   metadata,
+        "sections":   main_sections,
+        "references": ref_sections,   # kept separate from retrieval index
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 12.  CLI
+# 14.  Debug + CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def debug_page1(raw: list) -> None:
-    """Print page-1 lines with font sizes — helps diagnose title/metadata issues."""
-    print("\n=== DEBUG: page-1 lines (font_size | text) ===")
+    print("\n=== DEBUG: page-1 lines (font_size | classification | text) ===")
     page1 = [x for x in raw if x.get("page") == 1]
     for item in page1:
         t  = normalize_text(item.get("text", ""))
@@ -683,14 +724,12 @@ def debug_page1(raw: list) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Structure-aware cleaner: raw PDF JSON -> hierarchical document JSON"
+        description="Structure-aware cleaner: raw PDF JSON → hierarchical document JSON"
     )
     parser.add_argument("--input",  "-i", default="pdf_structure.json")
     parser.add_argument("--output", "-o", default="document_structure.json")
-    parser.add_argument(
-        "--debug", "-d", action="store_true",
-        help="Print page-1 font sizes to diagnose title/metadata issues",
-    )
+    parser.add_argument("--debug",  "-d", action="store_true",
+                        help="Print page-1 font sizes to diagnose title/metadata issues")
     args = parser.parse_args()
 
     raw = json.loads(Path(args.input).read_text(encoding="utf-8"))
@@ -700,14 +739,19 @@ def main():
 
     result = run_cleaner(raw)
 
-    Path(args.output).write_text(
+    # Always save into clean_json/ folder (auto-created if missing)
+    out_dir = Path("clean_json")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / Path(args.output).name
+    out_path.write_text(
         json.dumps(result, indent=4, ensure_ascii=False), encoding="utf-8"
     )
-    title_display = result["title"][:80] if result["title"] else "(empty — run with --debug to diagnose)"
-    print(f"\u2713  Saved \u2192 {args.output}")
-    print(f"   Title    : {title_display}")
-    print(f"   Authors  : {len(result['metadata']['authors'])} found")
-    print(f"   Sections : {len(result['sections'])} top-level")
+    print(f"✓  Saved → {out_path}")
+    print(f"   Title      : {title_display}")
+    print(f"   Authors    : {len(result['metadata']['authors'])} found")
+    print(f"   Sections   : {len(result['sections'])} main  |  "
+          f"{len(result['references'])} reference")
+
 
 if __name__ == "__main__":
     main()
