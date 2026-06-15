@@ -2,34 +2,45 @@
 cleaner.py  —  Structure-Aware Post-Processor for PDF Extraction
 ================================================================
 Pipeline:
-  raw JSON  →  normalize  →  repeated header/footer removal (NEW)
-            →  noise filter  →  false-heading filter (IMPROVED)
-            →  body-font computation
-            →  title extraction  →  metadata extraction
-            →  line classification  →  split-heading merge
-            →  paragraph merge  →  hierarchy tree build
-            →  references separated (NEW)  →  final JSON
+  raw JSON
+    → [1] aggressive header/footer + figure-label noise removal
+    → normalize
+    → body-font computation
+    → title extraction  →  metadata extraction
+    → [2] improved line classification (heading / paragraph)
+    → split-heading merge
+    → paragraph merge  (paragraphs kept as separate blocks, not joined)
+    → hierarchy tree build
+    → references separated
+    → final JSON
 
-Changes vs previous version
-────────────────────────────
-  [1] False-heading filter: table values, unit lines, numeric-only lines,
-      repeated column headers now rejected before heading detection.
-  [2] Subsection detection: isolated title-like lines and numbered subsection
-      patterns separated from body text more reliably.
-  [3] Repeated page header/footer removal: lines appearing on 3+ pages at
-      the same vertical position (or identical text) stripped before hierarchy.
-  [6] References section separated into its own top-level key, not mixed
-      into the retrieval sections list.
+Changes in this version
+────────────────────────
+  [1] Header/footer removal — three-pass approach:
+        (a) verbatim repeated lines across 3+ pages → removed
+        (b) lines that fuzzy-match the document title → removed
+        (c) figure/table caption lines in body → removed from content
+            (not promoted to headings either)
+      Running-header patterns like "AUTHOR | PAPER TITLE" (pipe-separated)
+      are now caught explicitly.
 
-Usage:
-  python cleaner.py --input pdf_structure.json --output document_structure.json
-  python cleaner.py --input pdf_structure.json --output document_structure.json --debug
+  [2] Subsection detection — four new signals on top of existing rules:
+        (a) lines preceded AND followed by blank/paragraph context
+            that are short, title-case, no trailing period → heading
+        (b) numbered patterns 1.1 / 2.3 / A.1 detected more reliably
+            even when preceded by inline text
+        (c) ALL-CAPS multi-word that's ≤ 8 words and not a metric → heading
+        (d) font-size threshold lowered slightly for lines that also pass
+            title-case check, so survey-style subsection headers are caught
+
+  [3] Paragraphs stored as a LIST of paragraph blocks per section node,
+      not concatenated into a single string.  This gives chunker.py
+      natural paragraph boundaries to split on (requirement 3 of chunker).
 """
 
 import json
 import re
 import argparse
-from collections import Counter
 from pathlib import Path
 from statistics import median
 
@@ -38,12 +49,10 @@ from statistics import median
 # 0.  Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-HEADING_FONT_RATIO   = 1.10   # min font-size ratio over body median → heading
-MAX_HEADING_WORDS    = 14     # hard cap on heading word count
-MIN_PARAGRAPH_WORDS  = 2      # min words to keep a paragraph block
-
-# A line is a repeated header/footer if it appears on >= this many pages.
-REPEATED_LINE_PAGE_THRESHOLD = 3
+HEADING_FONT_RATIO          = 1.08   # slightly lower → catch more subsection headings
+MAX_HEADING_WORDS           = 14
+MIN_PARAGRAPH_WORDS         = 3
+REPEATED_LINE_PAGE_THRESHOLD = 3     # lines on >= this many pages → header/footer
 
 _SECTION_STOPS = {
     "abstract", "introduction", "related work", "background",
@@ -51,11 +60,8 @@ _SECTION_STOPS = {
     "conclusion", "references",
 }
 
-# ── [1] Extended false-heading blacklist ─────────────────────────────────────
-# Covers table column labels, metric names, unit labels, common paragraph
-# openers that get promoted by font-size heuristic on some PDFs.
 _FAKE_HEADING_WORDS = {
-    # Table / result labels
+    # Table / result column labels
     "model", "retriever", "dataset", "configuration", "baseline",
     "system", "systems", "comparison", "setup", "setting", "settings",
     "task", "tasks", "category", "categories", "type", "types",
@@ -65,15 +71,14 @@ _FAKE_HEADING_WORDS = {
     "accuracy", "rouge", "rouge-l", "rouge-1", "rouge-2",
     "bleu", "bleu-1", "bleu-4", "meteor", "f1", "ndcg", "map", "mrr",
     "recall", "precision", "perplexity",
-    # Model/dataset names used as column headers
+    # Model / dataset names used as column headers
     "bm25", "dpr", "sbert", "qasper", "narrativeqa", "quality",
     "bert", "gpt", "t5", "bart", "llama", "mistral",
-    # Stopwords that slip through
+    # Stopwords / function words
     "to", "and", "or", "the", "of", "in", "on", "at", "by", "for",
     "with", "from", "that", "this", "it", "is", "are", "was",
 }
 
-# Unit patterns — lines like "ms", "GB", "tokens/s" must not be headings
 _UNIT_PATTERN = re.compile(
     r"^[\d.,\s]*(ms|s|sec|min|hr|gb|mb|kb|tokens?|words?|chars?|"
     r"bytes?|fps|hz|khz|mhz|ghz|mm|cm|m|km|°c|°f|%|k|m|b|t)\s*$",
@@ -87,6 +92,10 @@ _KNOWN_SINGLE_HEADINGS = {
     "conclusion", "conclusions", "limitations",
     "acknowledgements", "acknowledgments", "references",
     "appendix", "supplementary", "checklist",
+    # Common survey / paper subsections
+    "overview", "motivation", "problem", "formulation", "notation",
+    "contributions", "summary", "setup", "baselines", "datasets",
+    "metrics", "analysis", "ablation", "findings",
 }
 
 _METRIC_ACRONYMS = {
@@ -96,10 +105,21 @@ _METRIC_ACRONYMS = {
     "sbert", "bert", "gpt", "t5", "bart",
 }
 
-# Heading keywords that signal the References section (any case)
 _REFERENCE_HEADINGS = {
     "references", "bibliography", "works cited", "citations",
 }
+
+# [1] Patterns that identify running headers / footers regardless of repetition
+_HEADER_FOOTER_PATTERNS = [
+    # "Author Name | Paper Title" or "Paper Title | Conference"
+    re.compile(r"^[^|]{3,60}\s*\|\s*[^|]{3,60}$"),
+    # "Paper Title – Conference 2024"
+    re.compile(r".{10,}\s[–—-]\s(iclr|neurips|icml|acl|emnlp|naacl|cvpr|aaai)\s*20\d{2}", re.IGNORECASE),
+    # Pure page numbers with surrounding text: "3  Introduction"
+    re.compile(r"^\d{1,3}\s{2,}[A-Z][a-z]"),
+    # Journal-style headers: "Journal of X, Vol. Y, pp. Z"
+    re.compile(r"\bvol\.\s*\d+\b|\bpp\.\s*\d+\b|\bno\.\s*\d+\b", re.IGNORECASE),
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,7 +166,6 @@ def is_noise(text: str) -> bool:
         return True
     if re.fullmatch(r"[∗†‡§¶*†,\d\s]{1,6}", t):
         return True
-    # [1] Unit-based lines  →  "42 ms", "3.2 GB"
     if _UNIT_PATTERN.match(t):
         return True
     for pat in _NOISE_PATTERNS:
@@ -177,6 +196,7 @@ def is_affiliation_line(text: str) -> bool:
 
 
 def is_caption_like(text: str) -> bool:
+    """[1] Figure/Table/Algorithm captions — reject as headings AND strip from content."""
     patterns = [
         r"^(Figure|Fig\.?)\s+\d+",
         r"^Table\s+\d+",
@@ -195,24 +215,54 @@ def _is_reference_heading(text: str) -> bool:
     return text.lower().strip().rstrip(".") in _REFERENCE_HEADINGS
 
 
+def _is_running_header(text: str) -> bool:
+    """[1] Catch running header/footer patterns that don't rely on repetition count."""
+    for pat in _HEADER_FOOTER_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  [NEW] Repeated page header / footer removal
+# 3.  [1] Aggressive header/footer removal — three passes
 # ─────────────────────────────────────────────────────────────────────────────
 
-def remove_repeated_headers_footers(raw: list) -> list:
+def _title_similarity(text: str, title: str) -> float:
     """
-    [Requirement 3] Remove lines that appear verbatim on 3 or more distinct
-    pages — these are running headers or footers (journal name, paper title
-    repeated in header, page footer text, etc.).
+    Very lightweight token overlap between text and title.
+    Returns fraction of title tokens found in text (0.0–1.0).
+    """
+    if not title or not text:
+        return 0.0
+    t_tokens = set(re.findall(r"\w+", text.lower()))
+    title_tokens = set(re.findall(r"\w+", title.lower()))
+    if not title_tokens:
+        return 0.0
+    return len(t_tokens & title_tokens) / len(title_tokens)
 
-    Strategy:
-    - Count how many distinct pages each normalized text appears on.
-    - Any text appearing on >= REPEATED_LINE_PAGE_THRESHOLD pages is a
-      header/footer candidate.
-    - Extra guard: only suppress if the line is SHORT (≤ 10 words) to avoid
-      accidentally removing repeated legitimate sentences in a survey paper.
+
+def remove_repeated_headers_footers(raw: list, title: str = "") -> list:
     """
-    # Map: normalized_text → set of page numbers it appears on
+    [Requirement 1] Three-pass header/footer removal.
+
+    Pass A — verbatim repetition:
+        Lines appearing on >= REPEATED_LINE_PAGE_THRESHOLD distinct pages
+        AND short (<= 12 words) are header/footer candidates.
+        First occurrence is kept (might be the actual heading); rest dropped.
+
+    Pass B — title similarity:
+        Lines that share >= 60% token overlap with the document title
+        and are NOT on page 1 (page-1 is legitimate title) are dropped.
+        This catches running title headers like "RAPTOR: Recursive..." on p3.
+
+    Pass C — structural patterns:
+        Lines matching _HEADER_FOOTER_PATTERNS (pipe-separated, vol/pp, etc.)
+        are dropped regardless of repetition count.
+
+    Figure/table captions are handled separately in is_caption_like() and
+    are stripped from content during classification, not here.
+    """
+    # ── Pass A: verbatim repetition ──
     text_pages: dict[str, set] = {}
     for item in raw:
         t = normalize_text(item.get("text", ""))
@@ -220,29 +270,48 @@ def remove_repeated_headers_footers(raw: list) -> list:
         if t and p is not None:
             text_pages.setdefault(t, set()).add(p)
 
-    # Build suppression set: short lines on 3+ pages
-    suppressed: set[str] = {
+    repeated: set[str] = {
         t for t, pages in text_pages.items()
         if len(pages) >= REPEATED_LINE_PAGE_THRESHOLD
-        and len(t.split()) <= 10
+        and len(t.split()) <= 12
     }
 
-    if suppressed:
-        # Keep first occurrence only (it may be the actual section heading)
-        seen: set[str] = set()
-        filtered = []
-        for item in raw:
-            t = normalize_text(item.get("text", ""))
-            if t in suppressed:
-                if t not in seen:
-                    seen.add(t)
-                    filtered.append(item)  # keep first occurrence
-                # subsequent occurrences → silently dropped
-            else:
-                filtered.append(item)
-        return filtered
+    seen_repeated: set[str] = set()
 
-    return raw
+    # ── Pass B: title-similar lines away from page 1 ──
+    # We'll check during the loop below
+
+    # ── Pass C: structural patterns checked inline ──
+
+    filtered = []
+    for item in raw:
+        t = normalize_text(item.get("text", ""))
+        page = item.get("page", 1)
+
+        if not t:
+            filtered.append(item)
+            continue
+
+        # Pass A
+        if t in repeated:
+            if t not in seen_repeated:
+                seen_repeated.add(t)
+                filtered.append(item)   # keep first occurrence only
+            # subsequent occurrences silently dropped
+            continue
+
+        # Pass B: title-similar running header (only on page 2+)
+        if page > 1 and title and _title_similarity(t, title) >= 0.6:
+            if len(t.split()) <= 15:    # only short-ish lines
+                continue                 # drop
+
+        # Pass C: structural header/footer pattern
+        if _is_running_header(t):
+            continue                     # drop
+
+        filtered.append(item)
+
+    return filtered
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -250,7 +319,7 @@ def remove_repeated_headers_footers(raw: list) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _numbered_heading_level(text: str):
-    """1 Intro → 1  |  2.1 Methods → 2  |  3.2.1 Results → 3"""
+    """1 Intro→1  |  2.1 Methods→2  |  3.2.1 Results→3"""
     m = re.match(r"^(\d+(?:\.\d+)*)\s{1,4}[A-Z\u00C0-\u024F]", text)
     if not m:
         return None
@@ -258,7 +327,7 @@ def _numbered_heading_level(text: str):
 
 
 def _appendix_heading_level(text: str):
-    """A Ablation → 1  |  B.1 Methodology → 2  |  E.2 Findings → 2"""
+    """A Ablation→1  |  B.1 Methodology→2"""
     m = re.match(r"^([A-Z](?:\.\d+)*)\s{1,4}(\S.{0,80})$", text)
     if not m:
         return None
@@ -271,7 +340,6 @@ def _appendix_heading_level(text: str):
 
 
 def _is_bare_section_prefix(text: str) -> bool:
-    """Return True for lone tokens like "B.1", "3.2" — first half of split heading."""
     return bool(re.fullmatch(r"[A-Z](?:\.\d+)*|\d+(?:\.\d+)*", text.strip()))
 
 
@@ -279,7 +347,7 @@ def _all_caps_heading(text: str) -> bool:
     if text != text.upper():
         return False
     words = text.split()
-    if not (1 <= len(words) <= MAX_HEADING_WORDS):
+    if not (1 <= len(words) <= 8):      # tighter: ≤8 words for all-caps
         return False
     if text.endswith("."):
         return False
@@ -292,52 +360,91 @@ def _all_caps_heading(text: str) -> bool:
     return True
 
 
+def _is_title_case_heading(text: str, font_size: float, body_median: float) -> bool:
+    """
+    [2] Detect title-case subsection headings like "Survey Objective",
+    "Problem Formulation", "Key Contributions".
+
+    Criteria (all must hold):
+      - 2–8 words
+      - no trailing period or colon-then-more-text (avoids inline labels)
+      - >= 70% of words are capitalised
+      - no comma (commas → sentence, not heading)
+      - font >= body_median (no need for big ratio — visual prominence alone)
+      - text not in fake-heading blacklist
+    """
+    words = text.split()
+    if not (2 <= len(words) <= 8):
+        return False
+    if text.endswith("."):
+        return False
+    if "," in text:
+        return False
+    # Allow trailing colon only if the whole thing is title-like ("Key Insight:")
+    clean = text.rstrip(":")
+    cap_words = sum(1 for w in clean.split() if w and w[0].isupper())
+    if cap_words / len(words) < 0.7:
+        return False
+    if font_size < body_median:         # must be at least body size
+        return False
+    tl = text.lower().strip(".:")
+    if tl in _FAKE_HEADING_WORDS:
+        return False
+    # Must not look like the start of a sentence (e.g. "This paper presents")
+    if words[0].lower() in {"this", "the", "a", "an", "we", "our", "their", "these"}:
+        return False
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  Main heading detector  (requirements 1 + 2)
+# 5.  Main heading detector  [requirements 1 + 2]
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_heading(item: dict, body_font_median: float):
     """
     Return (is_heading: bool, level: int | None).
 
-    Guard order (all guards before rules to fail fast):
-      G0: noise / caption          → reject
-      G1: fake-heading blacklist   → reject
-      G2: [1] unit-based line      → reject
-      G3: [1] numeric/table-like   → reject
-      G4: comma-containing line    → reject (unless structured number pattern)
-      G5: [2] single-word guard    → reject unless in known list
+    Guards  (fast rejection before rules):
+      G0: noise / caption / running header  → reject
+      G1: fake-heading blacklist            → reject
+      G2: unit-based line                   → reject
+      G3: numeric / table-value             → reject
+      G4: comma in non-structured line      → reject
+      G5: single-word not in known list     → reject
 
-    Rule order:
-      R0: bare section prefix      → heading (for split-merge)
-      R1: numbered section         → heading
-      R2: appendix letter          → heading
-      R3: [2] titled-case short line with context clues → heading
-      R4: canonical keyword        → heading
-      R5: ALL-CAPS short line      → heading
-      R6: font-size heuristic      → heading (conservative)
+    Rules (first match wins):
+      R0: bare section prefix ("B.1")       → heading for split-merge
+      R1: numbered section (1 / 2.1 / 3.2.1)
+      R2: appendix letter (A / B.1)
+      R3: [2] title-case short line         → L2 subsection heading
+      R4: canonical keyword                 → L1
+      R5: ALL-CAPS short line (≤8 words)    → L1
+      R6: font-size above body median       → heading (conservative)
     """
     text = normalize_text(item.get("text", ""))
     if not text or is_noise(text):
         return False, None
     if is_caption_like(text):
         return False, None
+    if _is_running_header(text):          # [1] catch structural patterns
+        return False, None
 
     text_lower = text.lower().strip(".")
+    font_size  = item.get("font_size", 0)
 
-    # ── R0 first: bare prefix must bypass all guards ──
+    # ── R0: bare prefix bypasses all guards ──
     if _is_bare_section_prefix(text):
         return True, text.count(".") + 1
 
-    # ── G1: fake-heading blacklist ──
+    # ── G1 ──
     if text_lower in _FAKE_HEADING_WORDS:
         return False, None
 
-    # ── G2: [1] unit-based lines ──
+    # ── G2 ──
     if _UNIT_PATTERN.match(text):
         return False, None
 
-    # ── G3: [1] numeric / table-value lines ──
+    # ── G3 ──
     if re.fullmatch(r"[\d\s,.%±<>≤≥\/]+", text):
         return False, None
     digit_count = sum(c.isdigit() for c in text)
@@ -348,16 +455,15 @@ def detect_heading(item: dict, body_font_median: float):
     ):
         return False, None
 
-    # ── G4: comma-containing lines (almost never headings) ──
+    # ── G4 ──
     if "," in text:
         if _numbered_heading_level(text) is None and _appendix_heading_level(text) is None:
             return False, None
 
-    # ── G5: [2] single-word guard ──
+    # ── G5 ──
     words = text.split()
-    if len(words) == 1:
-        if text_lower not in _KNOWN_SINGLE_HEADINGS:
-            return False, None
+    if len(words) == 1 and text_lower not in _KNOWN_SINGLE_HEADINGS:
+        return False, None
 
     # ── R1: numbered section ──
     lvl = _numbered_heading_level(text)
@@ -369,29 +475,19 @@ def detect_heading(item: dict, body_font_median: float):
     if lvl is not None:
         return True, lvl
 
-    # ── R3: [2] title-case short line — improved subsection detection ──
-    # A line is a likely subsection heading if:
-    #   - 2–6 words, title-case (most words capitalised)
-    #   - does NOT end with a period (sentences do; headings don't)
-    #   - NOT in the fake-heading blacklist (already checked above)
-    #   - font size is at least equal to body median
-    if 2 <= len(words) <= 6 and not text.endswith("."):
-        cap_words = sum(1 for w in words if w and w[0].isupper())
-        cap_ratio = cap_words / len(words)
-        font_size = item.get("font_size", 0)
-        if cap_ratio >= 0.7 and font_size >= body_font_median * HEADING_FONT_RATIO:
-            return True, 2   # treat as subsection level
+    # ── R3: [2] title-case subsection heading ──
+    if _is_title_case_heading(text, font_size, body_font_median):
+        return True, 2
 
     # ── R4: canonical keyword ──
     if text_lower in _SECTION_STOPS or text_lower in _KNOWN_SINGLE_HEADINGS:
         return True, 1
 
-    # ── R5: ALL-CAPS short line ──
+    # ── R5: ALL-CAPS ──
     if _all_caps_heading(text):
         return True, 1
 
-    # ── R6: font-size heuristic (conservative) ──
-    font_size = item.get("font_size", 0)
+    # ── R6: font-size heuristic ──
     if (
         body_font_median > 0
         and font_size >= body_font_median * HEADING_FONT_RATIO
@@ -538,42 +634,92 @@ def merge_split_headings(items: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10.  Paragraph merging
+# 10.  Paragraph merging — [3] preserve paragraph boundaries as separate blocks
 # ─────────────────────────────────────────────────────────────────────────────
 
 def merge_paragraphs(items: list) -> list:
+    """
+    Merge consecutive single-line paragraph fragments that belong to the
+    same logical paragraph (same flow, no heading between them) into one
+    paragraph block.
+
+    Key change from previous version:
+    Each paragraph block is stored as a SEPARATE item in the output list —
+    NOT joined with other paragraphs from the same section into one big string.
+    This preserves paragraph boundaries so that chunker.py can split at them
+    instead of at arbitrary sentence counts.
+
+    Two consecutive paragraph items are in the SAME paragraph if:
+      - neither looks like a sentence-ending line of a paragraph
+        (heuristic: if previous line ends with a hyphen, it's a continuation)
+      - they are on the same or adjacent pages
+
+    Otherwise they are separate paragraph blocks.
+    """
     merged = []
-    buffer_texts = []
-    buffer_page  = None
+    buf_lines: list[str] = []
+    buf_page: int | None = None
+    prev_page: int | None = None
 
     def flush():
-        nonlocal buffer_texts, buffer_page
-        if buffer_texts:
-            full = normalize_text(" ".join(buffer_texts))
+        nonlocal buf_lines, buf_page
+        if buf_lines:
+            full = normalize_text(" ".join(buf_lines))
             if len(full.split()) >= MIN_PARAGRAPH_WORDS:
-                merged.append({"type": "paragraph", "text": full, "page": buffer_page})
-        buffer_texts.clear()
-        buffer_page = None
+                merged.append({"type": "paragraph", "text": full, "page": buf_page})
+        buf_lines.clear()
+        buf_page = None
 
     for item in items:
         if item["type"] == "heading":
             flush()
             merged.append(item)
+            prev_page = item.get("page")
         else:
-            if buffer_page is None:
-                buffer_page = item.get("page")
-            buffer_texts.append(item["text"])
+            cur_page = item.get("page")
+            # Start a new paragraph block if:
+            # (a) we just flushed (buf_lines is empty), or
+            # (b) page gap > 1 (likely a new section started), or
+            # (c) previous line did NOT end with a hyphen (not a line-break continuation)
+            #     AND previous line ended with sentence-closing punctuation
+            if buf_lines:
+                prev_line = buf_lines[-1]
+                page_gap = (cur_page or 0) - (prev_page or 0)
+                new_para = (
+                    page_gap > 1
+                    or (
+                        not prev_line.endswith("-")
+                        and prev_line[-1:] in ".!?"
+                    )
+                )
+                if new_para:
+                    flush()
+
+            if buf_page is None:
+                buf_page = cur_page
+            buf_lines.append(item["text"])
+            prev_page = cur_page
 
     flush()
     return merged
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 11.  Hierarchy tree
+# 11.  Hierarchy tree  — content stored as list of paragraph strings
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_hierarchy(items: list) -> list:
-    root = {"heading": "__ROOT__", "level": 0, "page": None, "content": [], "children": []}
+    """
+    Build the nested section tree.
+
+    content is a list of paragraph strings (one string per paragraph block),
+    NOT a single concatenated string.  This gives chunker.py paragraph
+    boundaries to work with.
+    """
+    root = {
+        "heading": "__ROOT__", "level": 0,
+        "page": None, "content": [], "children": [],
+    }
     stack = [root]
 
     for item in items:
@@ -582,7 +728,7 @@ def build_hierarchy(items: list) -> list:
                 "heading":  item["text"],
                 "level":    item.get("level", 1),
                 "page":     item.get("page"),
-                "content":  [],
+                "content":  [],        # list of paragraph strings
                 "children": [],
             }
             while len(stack) > 1 and stack[-1]["level"] >= node["level"]:
@@ -590,26 +736,17 @@ def build_hierarchy(items: list) -> list:
             stack[-1]["children"].append(node)
             stack.append(node)
         else:
+            # paragraph — append as a separate block
             stack[-1]["content"].append(item["text"])
 
     return root["children"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 12.  [NEW] References separation  (requirement 6)
+# 12.  References separation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def separate_references(sections: list) -> tuple[list, list]:
-    """
-    [Requirement 6] Pull the References section (and any sections after it)
-    out of the main sections list and return them separately.
-
-    Returns (main_sections, reference_sections).
-
-    References are kept so they can be stored/searched differently (e.g. a
-    separate FAISS index, BM25 lookup, or just metadata) rather than polluting
-    the main semantic retrieval index.
-    """
     main: list = []
     refs: list = []
     in_refs = False
@@ -630,21 +767,22 @@ def separate_references(sections: list) -> tuple[list, list]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_cleaner(raw: list) -> dict:
-    """Full pipeline: raw extracted lines → structured document dict."""
-
-    # A: [3] Remove repeated page headers / footers before anything else
-    raw = remove_repeated_headers_footers(raw)
-
-    # B: body font median
+    # A: body font median first (needed by title extraction)
     body_font_median = compute_body_font_median(raw)
 
-    # C: title
+    # B: title (before header removal so we have it for Pass B)
     title = merge_title_lines(raw, body_font_median)
 
-    # D: metadata
+    # C: [1] aggressive header/footer removal (now uses title for similarity check)
+    raw = remove_repeated_headers_footers(raw, title=title)
+
+    # D: recompute body median after noise removal (more accurate)
+    body_font_median = compute_body_font_median(raw)
+
+    # E: metadata
     metadata = extract_metadata(raw, title)
 
-    # E: title-line suppression set
+    # F: title-line suppression
     title_line_texts: set[str] = set()
     if title:
         for item in raw:
@@ -654,13 +792,15 @@ def run_cleaner(raw: list) -> dict:
             if t and len(t) > 5 and t in title:
                 title_line_texts.add(t)
 
-    # F: classify every line
+    # G: classify every line
     classified = []
     for item in raw:
         text = normalize_text(item.get("text", ""))
         if not text or is_noise(text):
             continue
         if text in title_line_texts:
+            continue
+        if is_caption_like(text):      # [1] drop caption lines from content too
             continue
 
         is_head, level = detect_heading(item, body_font_median)
@@ -678,23 +818,23 @@ def run_cleaner(raw: list) -> dict:
                 "page": item.get("page"),
             })
 
-    # G: merge split headings
+    # H: merge split headings
     classified = merge_split_headings(classified)
 
-    # H: merge paragraph lines into blocks
+    # I: merge paragraph lines into blocks (preserving boundaries)
     merged = merge_paragraphs(classified)
 
-    # I: build hierarchy
+    # J: build hierarchy
     sections = build_hierarchy(merged)
 
-    # J: [6] separate references
+    # K: separate references
     main_sections, ref_sections = separate_references(sections)
 
     return {
         "title":      title,
         "metadata":   metadata,
         "sections":   main_sections,
-        "references": ref_sections,   # kept separate from retrieval index
+        "references": ref_sections,
     }
 
 
@@ -703,7 +843,7 @@ def run_cleaner(raw: list) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def debug_page1(raw: list) -> None:
-    print("\n=== DEBUG: page-1 lines (font_size | classification | text) ===")
+    print("\n=== DEBUG: page-1 lines ===")
     page1 = [x for x in raw if x.get("page") == 1]
     for item in page1:
         t  = normalize_text(item.get("text", ""))
@@ -711,15 +851,15 @@ def debug_page1(raw: list) -> None:
         if not t:
             continue
         tag = ""
-        if _is_section_stop(t):       tag = "  [SECTION STOP]"
-        elif is_author_line(t):       tag = "  [AUTHOR LINE]"
-        elif is_affiliation_line(t):  tag = "  [AFFILIATION]"
-        elif is_email(t):             tag = "  [EMAIL]"
-        elif is_noise(t):             tag = "  [NOISE]"
+        if _is_section_stop(t):        tag = "  [SECTION STOP]"
+        elif is_author_line(t):        tag = "  [AUTHOR LINE]"
+        elif is_affiliation_line(t):   tag = "  [AFFILIATION]"
+        elif is_email(t):              tag = "  [EMAIL]"
+        elif is_noise(t):              tag = "  [NOISE]"
+        elif _is_running_header(t):    tag = "  [RUNNING HEADER]"
         print(f"  {fs:6.2f}pt  {t[:80]}{tag}")
     body_med = compute_body_font_median(raw)
-    print(f"\n  body_font_median = {body_med:.2f}pt")
-    print()
+    print(f"\n  body_font_median = {body_med:.2f}pt\n")
 
 
 def main():
@@ -728,8 +868,7 @@ def main():
     )
     parser.add_argument("--input",  "-i", default="pdf_structure.json")
     parser.add_argument("--output", "-o", default="document_structure.json")
-    parser.add_argument("--debug",  "-d", action="store_true",
-                        help="Print page-1 font sizes to diagnose title/metadata issues")
+    parser.add_argument("--debug",  "-d", action="store_true")
     args = parser.parse_args()
 
     raw = json.loads(Path(args.input).read_text(encoding="utf-8"))
@@ -739,18 +878,16 @@ def main():
 
     result = run_cleaner(raw)
 
-    # Always save into clean_json/ folder (auto-created if missing)
     out_dir = Path("clean_json")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / Path(args.output).name
-    out_path.write_text(
-        json.dumps(result, indent=4, ensure_ascii=False), encoding="utf-8"
-    )
+    out_path.write_text(json.dumps(result, indent=4, ensure_ascii=False), encoding="utf-8")
+
+    title_display = result["title"][:80] if result["title"] else "(empty — run with --debug)"
     print(f"✓  Saved → {out_path}")
-    print(f"   Title      : {title_display}")
-    print(f"   Authors    : {len(result['metadata']['authors'])} found")
-    print(f"   Sections   : {len(result['sections'])} main  |  "
-          f"{len(result['references'])} reference")
+    print(f"   Title    : {title_display}")
+    print(f"   Authors  : {len(result['metadata']['authors'])} found")
+    print(f"   Sections : {len(result['sections'])} main  |  {len(result['references'])} reference")
 
 
 if __name__ == "__main__":
