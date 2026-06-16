@@ -895,6 +895,100 @@ def debug_page1(raw: list) -> None:
     print(f"\n  body_font_median = {body_med:.2f}pt\n")
 
 
+
+def _write_clean_txt(result: dict, path) -> None:
+    """
+    Write a human-readable plain-text version of the cleaned document.
+
+    Format:
+      ════ TITLE ════
+      <title>
+
+      ── METADATA ──
+      Authors    : ...
+      Affiliation: ...
+      Emails     : ...
+
+      ════ SECTIONS ════
+
+      [L1] Heading
+      ────────────
+      paragraph text...
+
+        [L2] Sub-heading
+        ────────────────
+        paragraph text...
+
+      ════ REFERENCES ════
+      ...
+    """
+    lines = []
+
+    # Title
+    lines.append("=" * 72)
+    lines.append(f"  {result.get('title', '(no title)')}")
+    lines.append("=" * 72)
+    lines.append("")
+
+    # Metadata
+    meta = result.get("metadata", {})
+    lines.append("── METADATA " + "─" * 60)
+    lines.append(f"Authors     : {', '.join(meta.get('authors', [])) or '—'}")
+    lines.append(f"Affiliation : {meta.get('affiliation', '—')}")
+    lines.append(f"Emails      : {', '.join(meta.get('emails', [])) or '—'}")
+    lines.append(f"Source      : {meta.get('source', '—')}")
+    lines.append("")
+
+    # Sections
+    def write_section(node, depth=0):
+        indent = "  " * depth
+        heading = node.get("heading", "")
+        level   = node.get("level", 1)
+        page    = node.get("page", "?")
+        content = node.get("content", [])
+
+        # Heading line
+        lines.append(f"{indent}[L{level}] {heading}  (page {page})")
+        lines.append(indent + "─" * min(60, max(20, len(heading) + 12)))
+
+        # Content paragraphs
+        if isinstance(content, list):
+            for para in content:
+                if para.strip():
+                    for line in para.split("\n"):
+                        lines.append(f"{indent}{line}")
+                    lines.append("")
+        elif content.strip():
+            lines.append(f"{indent}{content}")
+            lines.append("")
+
+        # Children
+        for child in node.get("children", []):
+            write_section(child, depth + 1)
+
+    lines.append("═" * 72)
+    lines.append("  SECTIONS")
+    lines.append("═" * 72)
+    lines.append("")
+    for section in result.get("sections", []):
+        write_section(section)
+
+    # References
+    refs = result.get("references", [])
+    if refs:
+        lines.append("═" * 72)
+        lines.append("  REFERENCES")
+        lines.append("═" * 72)
+        lines.append("")
+        for ref_section in refs:
+            for para in ref_section.get("content", []):
+                if para.strip():
+                    lines.append(para)
+            lines.append("")
+
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Structure-aware cleaner: raw PDF JSON → hierarchical document JSON"
@@ -913,11 +1007,18 @@ def main():
 
     out_dir = Path("clean_json")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # JSON output
     out_path = out_dir / Path(args.output).name
     out_path.write_text(json.dumps(result, indent=4, ensure_ascii=False), encoding="utf-8")
 
+    # TXT output (same name, .txt extension)
+    txt_path = out_path.with_suffix(".txt")
+    _write_clean_txt(result, txt_path)
+
     title_display = result["title"][:80] if result["title"] else "(empty — run with --debug)"
-    print(f"✓  Saved → {out_path}")
+    print(f"✓  Saved JSON → {out_path}")
+    print(f"✓  Saved TXT  → {txt_path}")
     print(f"   Title    : {title_display}")
     print(f"   Authors  : {len(result['metadata']['authors'])} found")
     print(f"   Sections : {len(result['sections'])} main  |  {len(result['references'])} reference")
