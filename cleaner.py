@@ -196,15 +196,46 @@ def is_affiliation_line(text: str) -> bool:
 
 
 def is_caption_like(text: str) -> bool:
-    """[1] Figure/Table/Algorithm captions — reject as headings AND strip from content."""
+    """
+    [1][3] Figure/Table/Algorithm/Chart captions and labels.
+    Rejected as headings AND stripped from section content.
+
+    Covers:
+      - Inline captions: "Figure 1:", "Table 2:", "Algorithm 3"
+      - Chart/graph labels: "Chart 1", "Graph 2"
+      - Equation labels: "Equation 1", "(1)", "(2.3)"
+      - Standalone figure/table heading lines that would create empty sections
+    """
     patterns = [
         r"^(Figure|Fig\.?)\s+\d+",
         r"^Table\s+\d+",
         r"^Algorithm\s+\d+",
         r"^Listing\s+\d+",
+        r"^Chart\s+\d+",           # [3] chart labels
+        r"^Graph\s+\d+",           # [3] graph labels
+        r"^Equation\s+\d+",        # [3] equation labels
         r"^Appendix\s+[A-Z]\s*:",
+        r"^\(\d+(?:\.\d+)?\)$",  # standalone equation numbers like "(1)" or "(2.3)"
     ]
     return any(re.match(p, text, re.IGNORECASE) for p in patterns)
+
+
+def is_metadata_page_line(text: str, page: int) -> bool:
+    """
+    [1] Detect author/affiliation/email lines that belong in metadata,
+    not in section content.
+
+    On page 1 (the title/author page), lines that are author lists,
+    affiliations, or email addresses are pure metadata and must NEVER
+    enter the section/paragraph stream — they would otherwise appear
+    as garbage chunks in the retrieval index.
+
+    On pages 2+, these checks are relaxed (author names can legitimately
+    appear in body text as citations, affiliations in acknowledgements, etc.)
+    """
+    if page != 1:
+        return False
+    return is_author_line(text) or is_affiliation_line(text) or is_email(text)
 
 
 def _is_section_stop(text: str) -> bool:
@@ -800,7 +831,9 @@ def run_cleaner(raw: list) -> dict:
             continue
         if text in title_line_texts:
             continue
-        if is_caption_like(text):      # [1] drop caption lines from content too
+        if is_caption_like(text):              # [1][3] drop caption/chart lines
+            continue
+        if is_metadata_page_line(text, item.get("page", 0)):   # [1] drop page-1 metadata
             continue
 
         is_head, level = detect_heading(item, body_font_median)
