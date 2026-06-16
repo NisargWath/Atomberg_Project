@@ -614,6 +614,89 @@ def _print_summary(result: dict, doc: dict) -> None:
         print()
 
 
+
+def _write_chunks_txt(result: dict, path) -> None:
+    """
+    Write a human-readable plain-text version of all chunks.
+
+    Format per chunk:
+      ┌─────────────────────────────────────────────────────┐
+      │ [001] L2  2.1 Clustering  (page 3)                  │
+      │ Breadcrumb : Title > 2 Methods                      │
+      │ Words      : 143  |  split: paragraph 1/2           │
+      └─────────────────────────────────────────────────────┘
+      <content text>
+
+      (blank line between chunks)
+
+    Reference chunks follow in a separate block.
+    Skipped chunks are listed as a summary table at the end.
+    """
+    lines = []
+
+    def chunk_block(i: int, c: dict, label: str = "") -> None:
+        crumb   = " > ".join(c.get("breadcrumb", [])) or "(top level)"
+        split_s = (
+            f"  |  {c['split_reason']}-split {c['chunk_index']+1}/{c['total_chunks']}"
+            if c.get("is_split") else ""
+        )
+        ref_tag = "  [REF]" if c.get("is_reference") else ""
+        header  = f"[{i:03d}] L{c['level']}  {c['heading']}{ref_tag}  (page {c['page']})"
+        lines.append("┌" + "─" * 70 + "┐")
+        lines.append(f"│ {header:<68} │")
+        lines.append(f"│ Breadcrumb : {crumb:<56} │")
+        lines.append(f"│ Words      : {c['word_count']}{split_s:<54} │")
+        lines.append("└" + "─" * 70 + "┘")
+        if c.get("content"):
+            # Wrap content at 72 chars for readability
+            import textwrap
+            for para in c["content"].split("\n\n"):
+                wrapped = textwrap.fill(para.strip(), width=72)
+                lines.append(wrapped)
+                lines.append("")
+        else:
+            lines.append("(no content)")
+            lines.append("")
+
+    chunks     = result.get("chunks", [])
+    ref_chunks = result.get("reference_chunks", [])
+    skipped    = result.get("skipped_chunks", [])
+
+    # ── Main chunks ──
+    lines.append("=" * 72)
+    lines.append(f"  RETRIEVAL CHUNKS  ({len(chunks)} total)")
+    lines.append("=" * 72)
+    lines.append("")
+    for i, c in enumerate(chunks, 1):
+        chunk_block(i, c)
+
+    # ── Reference chunks ──
+    if ref_chunks:
+        lines.append("=" * 72)
+        lines.append(f"  REFERENCE CHUNKS  ({len(ref_chunks)} total)")
+        lines.append("=" * 72)
+        lines.append("")
+        for i, c in enumerate(ref_chunks, 1):
+            chunk_block(i, c)
+
+    # ── Skipped summary ──
+    if skipped:
+        lines.append("=" * 72)
+        lines.append(f"  SKIPPED CHUNKS  ({len(skipped)} total — not in retrieval index)")
+        lines.append("=" * 72)
+        lines.append("")
+        from collections import Counter
+        reasons = Counter(s["skip_reason"] for s in skipped)
+        for reason, count in sorted(reasons.items()):
+            lines.append(f"  {reason:25s} : {count} chunk(s)")
+        lines.append("")
+        lines.append("  Detail:")
+        for s in skipped:
+            lines.append(f"    [L{s['level']}] {s['heading']:<40}  {s['skip_reason']}  ({s['word_count']}w)")
+
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Hierarchical chunker: document_structure.json → chunks.json"
@@ -647,11 +730,19 @@ def main():
 
         out_dir  = Path("chunker_json")
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # JSON output
         out_path = out_dir / Path(args.output).name
         out_path.write_text(
             json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8"
         )
-        print(f"✓  Saved → {out_path}")
+
+        # TXT output (same name, .txt extension)
+        txt_path = out_path.with_suffix(".txt")
+        _write_chunks_txt(result, txt_path)
+
+        print(f"✓  Saved JSON → {out_path}")
+        print(f"✓  Saved TXT  → {txt_path}")
         print(f"   Emitted chunks  : {len(chunks)}  ({split_ct} split, {short_ct} short)")
         print(f"   Reference chunks: {len(ref_chunks)}")
         print(f"   Skipped chunks  : {len(skipped)}")
