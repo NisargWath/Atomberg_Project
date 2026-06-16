@@ -1,45 +1,62 @@
 """
 chunker.py  —  Structure-Aware Hierarchical Chunker
 ====================================================
-Reads document_structure.json (from cleaner.py) and emits embedding-ready
+Reads document_structure.json (from cleaner.py) and emits retrieval-ready
 chunks with full structural metadata.
 
 Changes in this version
 ────────────────────────
-  [1] Caption / running-header filtering done upstream (cleaner.py).
-      Chunker no longer needs to re-filter — it trusts the input is clean.
+  [2] Empty chunks skipped: walk_tree never emits a chunk whose content
+      is empty or whose word_count == 0, unless it has children (in which
+      case it may be kept as a structural stub — see [3]).
 
-  [2] Subsection boundaries from cleaner's improved heading detection are
-      respected automatically — better hierarchy → better breadcrumbs.
+  [3] Structural parent-only nodes skipped from retrieval output:
+      A node that has children but zero direct content is a pure organiser
+      (e.g. "2 Methods" with only "2.1 / 2.2 / 2.3" children and no intro
+      paragraph of its own).  Such nodes are not emitted as standalone
+      chunks because they carry no retrievable text.
+      The heading is still used as a breadcrumb for its children.
 
-  [3] SEMANTIC paragraph-boundary splitting:
-        - cleaner.py now stores content as a LIST of paragraph strings,
-          not one big blob.
-        - chunker first tries to split at paragraph boundaries.
-        - only falls back to sentence-boundary splitting when a single
-          paragraph still exceeds CHUNK_MAX_WORDS.
-        - never splits in the middle of a paragraph if it fits.
-        This produces chunks that start and end at natural thought boundaries.
+  [4] Short-chunk threshold gate:
+      Any chunk whose word_count < RETRIEVAL_MIN_WORDS after all splitting
+      is either merged with the next sibling chunk (if within the same
+      section) or dropped entirely from the retrieval output.
+      The threshold is separate from CHUNK_MIN_WORDS (the split target)
+      so it can be tuned independently.
+
+  [5] Figure/table/chart heading filter (belt-and-suspenders):
+      Even if a figure-label heading slips past cleaner.py's filter, the
+      chunker now has a secondary gate: any heading that matches caption
+      patterns is skipped at chunk-emit time.
+
+  [6] Only retrieval-meaningful chunks emitted:
+      A chunk is retrieval-meaningful iff:
+        (a) its content has >= RETRIEVAL_MIN_WORDS words, OR
+        (b) it has children (it matters as a navigation breadcrumb node),
+            AND it has at least some content (even if below threshold)
+      Metadata-only, empty-content, and heading-only stubs are excluded.
 
 Output schema per chunk
 ────────────────────────
   heading        : section heading
-  level          : hierarchy depth (1/2/3)
+  level          : depth (1/2/3...)
   page           : page of first word in this chunk
   breadcrumb     : ancestor heading path (outermost first)
   context_prefix : "Title > Parent > Heading" string
-  content        : paragraph text (100-400 words, semantically bounded)
-  word_count     : words in content
-  chunk_index    : 0-based position among split sub-chunks of same section
-  total_chunks   : total sub-chunks this section produced
-  is_split       : True when section content was split across chunks
-  split_reason   : "paragraph" | "sentence" | "none" — why we split
-  embed_text     : context_prefix + "\\n\\n" + content
+  content        : text (paragraph-boundary split, 100-400 words target)
+  word_count     : content words
+  chunk_index    : 0-based index among sub-chunks of same section
+  total_chunks   : total sub-chunks produced from this section
+  is_split       : True when content was split across multiple chunks
+  split_reason   : "none" | "paragraph" | "sentence"
+  embed_text     : context_prefix + "\\n\\n" + content  (pass to embedder)
+  retrieval_skip : True on chunks excluded from retrieval (debug mode only)
 
 Usage:
   python chunker.py --input document_structure.json --output chunks.json
   python chunker.py --input document_structure.json --summary
   python chunker.py --input document_structure.json --min-words 30 --merge-short
+  python chunker.py --input document_structure.json --debug-skipped
 """
 
 import json
@@ -52,18 +69,81 @@ from pathlib import Path
 # 0.  Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-CHUNK_MIN_WORDS      = 100
-CHUNK_MAX_WORDS      = 400
-SHORT_CHUNK_THRESHOLD = 30
-MAX_BREADCRUMB_DEPTH  = None   # None = include all ancestor levels
+CHUNK_MIN_WORDS      = 100    # target lower bound when splitting large sections
+CHUNK_MAX_WORDS      = 400    # target upper bound when splitting large sections
+SHORT_CHUNK_THRESHOLD = 30    # flag as "short" for reporting
+RETRIEVAL_MIN_WORDS  = 20     # [4][6] minimum words to be retrieval-worthy
+MAX_BREADCRUMB_DEPTH = None   # None = all levels
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1.  Sentence splitter  (fallback when a single paragraph is too large)
+# 1.  Caption / figure-heading filter  [5]
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CAPTION_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"^(Figure|Fig\.?)\s+\d+",
+        r"^Table\s+\d+",
+        r"^Algorithm\s+\d+",
+        r"^Listing\s+\d+",
+        r"^Chart\s+\d+",
+        r"^Graph\s+\d+",
+        r"^Equation\s+\d+",
+        r"^Appendix\s+[A-Z]\s*:",
+        r"^\(\d+(?:\.\d+)?\)$",
+    ]
+]
+
+
+def _is_caption_heading(text: str) -> bool:
+    """[5] Belt-and-suspenders: catch figure/table/chart headings at emit time."""
+    return any(pat.match(text) for pat in _CAPTION_PATTERNS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  Retrieval-worthiness gate  [2][3][4][6]
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_retrieval_worthy(
+    content: str,
+    heading: str,
+    has_children: bool,
+    word_count: int,
+) -> tuple[bool, str]:
+    """
+    [Requirements 2, 3, 4, 6] Decide whether a chunk should be emitted.
+
+    Returns (emit: bool, reason: str).
+
+    Rules (evaluated in order — first match wins):
+      SKIP-1: heading is a caption/figure/chart label         → skip [5]
+      SKIP-2: content is empty AND node has no children       → skip [2]
+      SKIP-3: content is empty AND node has children only     → skip [3]
+               (pure structural organiser — kept as breadcrumb,
+                not as a retrieval chunk)
+      SKIP-4: word_count < RETRIEVAL_MIN_WORDS                → skip [4]
+               (too short to be useful as a standalone chunk)
+      EMIT:   everything else                                 → emit [6]
+    """
+    if _is_caption_heading(heading):
+        return False, "caption-heading"
+
+    if word_count == 0:
+        if has_children:
+            return False, "empty-parent"     # [3] pure structural organiser
+        return False, "empty-leaf"           # [2] completely empty
+
+    if word_count < RETRIEVAL_MIN_WORDS:
+        return False, "too-short"            # [4] below retrieval threshold
+
+    return True, "ok"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Sentence splitter  (fallback when a single paragraph is too large)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _split_sentences(text: str) -> list[str]:
-    """Split on sentence boundaries, protecting common abbreviations."""
     protected = re.sub(
         r"\b(e\.g\.|i\.e\.|et al\.|Fig\.|fig\.|Eq\.|eq\.|cf\.|vs\.|approx\.|"
         r"Dr\.|Mr\.|Ms\.|Prof\.|Sr\.|Jr\.|[A-Z]\.[A-Z]\.)",
@@ -75,10 +155,6 @@ def _split_sentences(text: str) -> list[str]:
 
 
 def _pack_sentences(sentences: list[str], min_w: int, max_w: int) -> list[str]:
-    """
-    Greedily pack sentences into chunks of [min_w, max_w] words.
-    Any single sentence > max_w is hard-split on word boundaries.
-    """
     chunks: list[str] = []
     buf: list[str] = []
     buf_words = 0
@@ -87,7 +163,7 @@ def _pack_sentences(sentences: list[str], min_w: int, max_w: int) -> list[str]:
         nonlocal buf, buf_words
         if buf:
             chunks.append(" ".join(buf))
-        buf = []
+        buf.clear()
         buf_words = 0
 
     for sent in sentences:
@@ -105,7 +181,6 @@ def _pack_sentences(sentences: list[str], min_w: int, max_w: int) -> list[str]:
 
     flush()
 
-    # Merge a tiny trailing chunk into the previous one
     if len(chunks) >= 2 and len(chunks[-1].split()) < min_w:
         tail = chunks.pop()
         chunks[-1] = chunks[-1] + " " + tail
@@ -114,7 +189,7 @@ def _pack_sentences(sentences: list[str], min_w: int, max_w: int) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  [3] Semantic paragraph-boundary splitter
+# 4.  Semantic paragraph-boundary splitter
 # ─────────────────────────────────────────────────────────────────────────────
 
 def split_paragraphs_into_chunks(
@@ -123,27 +198,17 @@ def split_paragraphs_into_chunks(
     max_words: int = CHUNK_MAX_WORDS,
 ) -> tuple[list[str], str]:
     """
-    [Requirement 3] Split content into chunks, preferring paragraph boundaries.
+    Split content at paragraph boundaries first; fall back to sentence
+    boundaries only when a single paragraph exceeds max_words.
 
-    Algorithm:
-    1. Walk paragraphs in order, accumulating words.
-    2. When adding the next paragraph would push us over max_words AND we
-       already have at least min_words → close the current chunk (paragraph
-       boundary split).
-    3. If a SINGLE paragraph is itself > max_words, fall back to sentence-
-       boundary splitting for just that paragraph (sentence boundary split).
-    4. Never split in the middle of a paragraph that fits within max_words.
-
-    Returns:
-      (list_of_chunk_strings, split_reason)
-      split_reason: "none" | "paragraph" | "sentence"
+    Returns (list_of_chunk_strings, split_reason).
+    split_reason: "none" | "paragraph" | "sentence"
     """
     if not paragraphs:
         return [], "none"
 
     total_words = sum(len(p.split()) for p in paragraphs)
 
-    # Everything fits in one chunk — no split needed
     if total_words <= max_words:
         combined = "\n\n".join(p for p in paragraphs if p.strip())
         return [combined] if combined.strip() else [], "none"
@@ -159,31 +224,24 @@ def split_paragraphs_into_chunks(
             continue
         pw = len(para.split())
 
-        # Single oversized paragraph → sentence-level fallback
         if pw > max_words:
-            # First flush whatever we have
             if buf_paras and buf_words >= min_words:
                 chunks.append("\n\n".join(buf_paras))
                 buf_paras, buf_words = [], 0
-            # Sentence split this paragraph
             sents = _split_sentences(para)
             sent_chunks = _pack_sentences(sents, min_words, max_words)
-            # The first sent_chunk might be merged with leftover buf
-            if buf_paras:
-                first = sent_chunks.pop(0) if sent_chunks else ""
-                if first:
-                    merged_words = buf_words + len(first.split())
-                    if merged_words <= max_words:
-                        buf_paras.append(first)
-                        buf_words = merged_words
-                    else:
-                        chunks.append("\n\n".join(buf_paras))
-                        buf_paras, buf_words = [first], len(first.split())
+            if buf_paras and sent_chunks:
+                first = sent_chunks.pop(0)
+                if buf_words + len(first.split()) <= max_words:
+                    buf_paras.append(first)
+                    buf_words += len(first.split())
+                else:
+                    chunks.append("\n\n".join(buf_paras))
+                    buf_paras, buf_words = [first], len(first.split())
             chunks.extend(sent_chunks)
             split_reason = "sentence"
             continue
 
-        # Would this paragraph push us over max AND we already have min?
         if buf_words + pw > max_words and buf_words >= min_words:
             chunks.append("\n\n".join(buf_paras))
             buf_paras, buf_words = [], 0
@@ -191,10 +249,8 @@ def split_paragraphs_into_chunks(
         buf_paras.append(para)
         buf_words += pw
 
-    # Flush remainder
     if buf_paras:
         remainder = "\n\n".join(buf_paras)
-        # Merge tiny remainder into previous chunk if possible
         if buf_words < min_words and chunks:
             prev = chunks[-1]
             if len(prev.split()) + buf_words <= max_words * 1.1:
@@ -208,7 +264,7 @@ def split_paragraphs_into_chunks(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Build one embedding-ready chunk dict
+# 5.  Build one embedding-ready chunk dict
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_chunk(
@@ -252,31 +308,40 @@ def _build_chunk(
         "is_split":       total_chunks > 1,
         "split_reason":   split_reason,
         "short":          word_count < SHORT_CHUNK_THRESHOLD,
-        "has_children":   False,
+        "has_children":   False,   # set by caller
         "embed_text":     embed_text,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  Core: walk the section tree depth-first
+# 6.  Core: walk the section tree depth-first  [2][3][4][5][6]
 # ─────────────────────────────────────────────────────────────────────────────
 
 def walk_tree(
     nodes: list,
     breadcrumb: list[str] = None,
     title: str = "",
-) -> list[dict]:
+    debug_skipped: bool = False,
+) -> tuple[list[dict], list[dict]]:
     """
-    Walk the hierarchy tree and emit chunks.
+    Walk the hierarchy tree and emit retrieval-worthy chunks.
 
-    Content per node is now a LIST of paragraph strings (from cleaner.py).
-    We pass the whole list to split_paragraphs_into_chunks() which handles
-    paragraph-boundary splitting first, sentence-boundary only as fallback.
+    Returns (emitted_chunks, skipped_chunks).
+    skipped_chunks is populated only when debug_skipped=True.
+
+    For each node:
+      1. Collect direct content paragraphs (children excluded).
+      2. Apply the retrieval-worthiness gate.
+      3. If worthy: split at paragraph boundaries, emit one chunk per split.
+      4. If not worthy: record in skipped (debug mode); still recurse so
+         children are processed with this node's heading in their breadcrumb.
+      5. Recurse into children with updated breadcrumb.
     """
     if breadcrumb is None:
         breadcrumb = []
 
-    chunks: list[dict] = []
+    emitted: list[dict] = []
+    skipped: list[dict] = []
 
     for node in nodes:
         heading   = node.get("heading", "")
@@ -284,123 +349,237 @@ def walk_tree(
         page      = node.get("page")
         content   = node.get("content", [])
         children  = node.get("children", [])
+        has_ch    = bool(children)
 
-        # content may be a list of paragraph strings (new format) or a
-        # single string (legacy format from older cleaner versions)
+        # Normalise content to list of paragraph strings
         if isinstance(content, str):
             paragraphs = [content] if content.strip() else []
         else:
             paragraphs = [p for p in content if p and p.strip()]
 
-        # [3] Semantic split at paragraph boundaries first
-        text_chunks, split_reason = split_paragraphs_into_chunks(paragraphs)
-        total = len(text_chunks) if text_chunks else 1
+        direct_text = "\n\n".join(paragraphs)
+        total_words = len(direct_text.split()) if direct_text else 0
 
-        if not text_chunks:
-            chunk = _build_chunk(
-                heading=heading, level=level, page=page,
-                breadcrumb=breadcrumb, content="",
-                title=title, chunk_index=0, total_chunks=1,
-                split_reason="none",
-            )
-            chunk["has_children"] = bool(children)
-            chunks.append(chunk)
+        # ── Retrieval gate ──
+        worthy, reason = _is_retrieval_worthy(
+            content=direct_text,
+            heading=heading,
+            has_children=has_ch,
+            word_count=total_words,
+        )
+
+        if worthy:
+            # [paragraph-boundary split]
+            text_chunks, split_reason = split_paragraphs_into_chunks(paragraphs)
+            total = len(text_chunks) if text_chunks else 1
+
+            if not text_chunks:
+                # Content existed but entirely whitespace after join — skip
+                pass
+            else:
+                for idx, text_part in enumerate(text_chunks):
+                    chunk = _build_chunk(
+                        heading=heading, level=level, page=page,
+                        breadcrumb=breadcrumb, content=text_part,
+                        title=title, chunk_index=idx, total_chunks=total,
+                        split_reason=split_reason if total > 1 else "none",
+                    )
+                    chunk["has_children"] = has_ch
+                    emitted.append(chunk)
+
         else:
-            for idx, text_part in enumerate(text_chunks):
-                chunk = _build_chunk(
-                    heading=heading, level=level, page=page,
-                    breadcrumb=breadcrumb, content=text_part,
-                    title=title, chunk_index=idx, total_chunks=total,
-                    split_reason=split_reason if total > 1 else "none",
-                )
-                chunk["has_children"] = bool(children)
-                chunks.append(chunk)
+            # Not retrieval-worthy — record for debug, but still recurse
+            if debug_skipped:
+                skipped.append({
+                    "heading":      heading,
+                    "level":        level,
+                    "page":         page,
+                    "skip_reason":  reason,
+                    "word_count":   total_words,
+                    "has_children": has_ch,
+                })
 
+        # Recurse into children regardless of whether this node was emitted
         if children:
             child_breadcrumb = breadcrumb + [heading]
-            chunks.extend(walk_tree(children, child_breadcrumb, title))
+            child_emitted, child_skipped = walk_tree(
+                children, child_breadcrumb, title, debug_skipped
+            )
+            emitted.extend(child_emitted)
+            skipped.extend(child_skipped)
 
-    return chunks
+    return emitted, skipped
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  Short-chunk merge (optional)
+# 7.  [4] Short-chunk merge — sibling-aware  [updated]
 # ─────────────────────────────────────────────────────────────────────────────
 
-def merge_short_chunks(chunks: list, min_words: int = SHORT_CHUNK_THRESHOLD) -> list:
+def merge_short_chunks(
+    chunks: list[dict],
+    min_words: int = RETRIEVAL_MIN_WORDS,
+) -> list[dict]:
+    """
+    [Requirement 4] Post-pass: merge chunks below min_words into an adjacent
+    sibling or parent chunk rather than dropping them outright.
+
+    Merge strategy (in priority order):
+      1. If the NEXT chunk has the same heading and level (it's a sibling
+         sub-chunk from the same section), prepend this chunk's content to it.
+      2. If the PREVIOUS chunk has a lower level (it's the parent), append
+         this chunk's content to the parent.
+      3. Otherwise drop (the chunk has no useful standalone value).
+    """
     if not chunks:
         return chunks
+
     result: list[dict] = []
-    for chunk in chunks:
-        if chunk["word_count"] < min_words and not chunk["has_children"] and result:
+
+    i = 0
+    while i < len(chunks):
+        chunk = chunks[i]
+
+        if chunk["word_count"] < min_words and not chunk["has_children"]:
+            # Try merge-forward into next sibling
+            if (
+                i + 1 < len(chunks)
+                and chunks[i + 1]["heading"] == chunk["heading"]
+                and chunks[i + 1]["level"] == chunk["level"]
+            ):
+                nxt = chunks[i + 1]
+                sep = "\n\n" if chunk["content"] and nxt["content"] else ""
+                nxt["content"]    = chunk["content"] + sep + nxt["content"]
+                nxt["embed_text"] = nxt["context_prefix"] + "\n\n" + nxt["content"]
+                nxt["word_count"] = len(nxt["content"].split())
+                nxt["short"]      = nxt["word_count"] < SHORT_CHUNK_THRESHOLD
+                i += 1   # skip this chunk, next iteration processes the merged one
+                continue
+
+            # Try merge-backward into nearest lower-level ancestor
             parent_idx = None
-            for i in range(len(result) - 1, -1, -1):
-                if result[i]["level"] < chunk["level"]:
-                    parent_idx = i
+            for j in range(len(result) - 1, -1, -1):
+                if result[j]["level"] < chunk["level"]:
+                    parent_idx = j
                     break
+
             if parent_idx is not None:
                 parent = result[parent_idx]
-                addition = f"\n\n[{chunk['heading']}]\n{chunk['content']}" if chunk["content"] else ""
+                addition = (
+                    f"\n\n[{chunk['heading']}]\n{chunk['content']}"
+                    if chunk["content"] else ""
+                )
                 parent["content"]    += addition
                 parent["embed_text"] += addition
                 parent["word_count"] += chunk["word_count"]
-                parent["short"]       = parent["word_count"] < min_words
+                parent["short"]       = parent["word_count"] < SHORT_CHUNK_THRESHOLD
+                i += 1
                 continue
+
+            # No merge target — drop silently
+            i += 1
+            continue
+
         result.append(chunk)
+        i += 1
+
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  References chunking (separate index)
+# 8.  References chunking (separate index, no retrieval gate)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def chunk_references(ref_sections: list, title: str = "") -> list[dict]:
     """
-    Reference entries are NOT split — each is typically a single citation
-    that should stay intact for BM25 / citation lookup.
+    Reference entries are walked without the retrieval gate — each entry
+    is typically short by design and should stay intact for BM25/citation
+    lookup.  They are marked is_reference=True for routing to a separate index.
     """
-    ref_chunks = walk_tree(ref_sections, breadcrumb=[], title=title)
-    for chunk in ref_chunks:
-        chunk["is_reference"] = True
+    ref_chunks: list[dict] = []
+    for section in ref_sections:
+        content  = section.get("content", [])
+        heading  = section.get("heading", "")
+        page     = section.get("page")
+        if isinstance(content, list):
+            paragraphs = [p for p in content if p and p.strip()]
+        else:
+            paragraphs = [content] if content else []
+
+        for para in paragraphs:
+            wc = len(para.split())
+            if wc == 0:
+                continue
+            chunk = _build_chunk(
+                heading=heading, level=1, page=page,
+                breadcrumb=[], content=para,
+                title=title, chunk_index=0, total_chunks=1,
+            )
+            chunk["has_children"] = False
+            chunk["is_reference"] = True
+            ref_chunks.append(chunk)
+
     return ref_chunks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7.  Main pipeline
+# 9.  Main pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_chunker(doc: dict, min_words: int = 0, merge_short: bool = False) -> dict:
+def run_chunker(
+    doc: dict,
+    min_words: int = 0,
+    merge_short: bool = False,
+    debug_skipped: bool = False,
+) -> dict:
+    """
+    Returns:
+      {
+        "chunks":           [...],   # retrieval-worthy main chunks
+        "reference_chunks": [...],   # reference entries for separate index
+        "skipped_chunks":   [...],   # debug: chunks that failed the gate
+      }
+    """
     title        = doc.get("title", "")
     sections     = doc.get("sections", [])
     ref_sections = doc.get("references", [])
 
-    chunks = walk_tree(sections, breadcrumb=[], title=title)
+    emitted, skipped = walk_tree(
+        sections, breadcrumb=[], title=title, debug_skipped=debug_skipped
+    )
+
     if merge_short and min_words > 0:
-        chunks = merge_short_chunks(chunks, min_words=min_words)
+        emitted = merge_short_chunks(emitted, min_words=min_words)
 
     reference_chunks = chunk_references(ref_sections, title=title)
 
-    return {"chunks": chunks, "reference_chunks": reference_chunks}
+    return {
+        "chunks":           emitted,
+        "reference_chunks": reference_chunks,
+        "skipped_chunks":   skipped,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8.  CLI
+# 10.  CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _print_summary(result: dict, doc: dict) -> None:
     chunks     = result["chunks"]
     ref_chunks = result["reference_chunks"]
+    skipped    = result.get("skipped_chunks", [])
 
     para_splits = sum(1 for c in chunks if c.get("split_reason") == "paragraph")
     sent_splits = sum(1 for c in chunks if c.get("split_reason") == "sentence")
 
     print(f"\n{'─'*72}")
-    print(f"  Document : {doc.get('title','(no title)')[:68]}")
-    print(f"  Chunks   : {len(chunks)} main  |  {len(ref_chunks)} reference")
-    print(f"  Splits   : {para_splits} paragraph-boundary  |  {sent_splits} sentence-boundary")
-    print(f"  Short    : {sum(1 for c in chunks if c['short'])} below {SHORT_CHUNK_THRESHOLD}w")
+    print(f"  Document  : {doc.get('title','(no title)')[:68]}")
+    print(f"  Emitted   : {len(chunks)} main  |  {len(ref_chunks)} reference")
+    print(f"  Skipped   : {len(skipped)}")
+    print(f"  Splits    : {para_splits} paragraph  |  {sent_splits} sentence")
+    print(f"  Short     : {sum(1 for c in chunks if c['short'])} below {SHORT_CHUNK_THRESHOLD}w")
     print(f"{'─'*72}\n")
 
+    print("  EMITTED CHUNKS")
     for i, c in enumerate(chunks):
         indent = "  " * (c["level"] - 1)
         flags = ""
@@ -417,6 +596,15 @@ def _print_summary(result: dict, doc: dict) -> None:
             print(f"         {indent}content: {preview}...")
         print()
 
+    if skipped:
+        print(f"  SKIPPED CHUNKS ({len(skipped)})")
+        reasons: dict[str, int] = {}
+        for s in skipped:
+            reasons[s["skip_reason"]] = reasons.get(s["skip_reason"], 0) + 1
+        for reason, count in sorted(reasons.items()):
+            print(f"    {reason:20s} : {count}")
+        print()
+
     if ref_chunks:
         print(f"  REFERENCE CHUNKS ({len(ref_chunks)})")
         for rc in ref_chunks[:3]:
@@ -430,21 +618,29 @@ def main():
     parser = argparse.ArgumentParser(
         description="Hierarchical chunker: document_structure.json → chunks.json"
     )
-    parser.add_argument("--input",       "-i", default="document_structure.json")
-    parser.add_argument("--output",      "-o", default="chunks.json")
-    parser.add_argument("--min-words",   "-m", type=int, default=0)
-    parser.add_argument("--merge-short", action="store_true")
-    parser.add_argument("--summary",     "-s", action="store_true")
+    parser.add_argument("--input",          "-i", default="document_structure.json")
+    parser.add_argument("--output",         "-o", default="chunks.json")
+    parser.add_argument("--min-words",      "-m", type=int, default=0)
+    parser.add_argument("--merge-short",    action="store_true")
+    parser.add_argument("--summary",        "-s", action="store_true")
+    parser.add_argument("--debug-skipped",  action="store_true",
+                        help="Include skipped chunks in output for inspection")
     args = parser.parse_args()
 
     doc    = json.loads(Path(args.input).read_text(encoding="utf-8"))
-    result = run_chunker(doc, min_words=args.min_words, merge_short=args.merge_short)
+    result = run_chunker(
+        doc,
+        min_words      = args.min_words,
+        merge_short    = args.merge_short,
+        debug_skipped  = args.debug_skipped,
+    )
 
     if args.summary:
         _print_summary(result, doc)
     else:
         chunks     = result["chunks"]
         ref_chunks = result["reference_chunks"]
+        skipped    = result.get("skipped_chunks", [])
         split_ct   = sum(1 for c in chunks if c["is_split"])
         short_ct   = sum(1 for c in chunks if c["short"])
         all_pages  = [c["page"] for c in chunks if c["page"]]
@@ -456,8 +652,9 @@ def main():
             json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         print(f"✓  Saved → {out_path}")
-        print(f"   Main chunks     : {len(chunks)}  ({split_ct} split, {short_ct} short)")
+        print(f"   Emitted chunks  : {len(chunks)}  ({split_ct} split, {short_ct} short)")
         print(f"   Reference chunks: {len(ref_chunks)}")
+        print(f"   Skipped chunks  : {len(skipped)}")
         if all_pages:
             print(f"   Page range      : {min(all_pages)} – {max(all_pages)}")
         print(f"   Levels          : {sorted(set(c['level'] for c in chunks))}")
