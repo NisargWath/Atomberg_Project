@@ -63,8 +63,12 @@ except ImportError:
     _FAISS_AVAILABLE = False
     print("[WARN] faiss not installed.  Run: pip install faiss-cpu", file=sys.stderr)
 
+# [LOCAL-MODEL] Import both FlagEmbedding classes needed for the two model families.
+# BGEM3FlagModel  → BGE-M3  (--model-kind bge-m3)
+# FlagModel       → BGE v1.5 (--model-kind bge-v15)
+# Neither class contacts Hugging Face when a local folder path is supplied.
 try:
-    from FlagEmbedding import BGEM3FlagModel
+    from FlagEmbedding import BGEM3FlagModel, FlagModel
     _FLAG_AVAILABLE = True
 except ImportError:
     _FLAG_AVAILABLE = False
@@ -75,13 +79,26 @@ except ImportError:
 # 0.  Config  (all tuneable in one place)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Default embedding model.  Change here to benchmark a different model.
-# Supported drop-ins:  "BAAI/bge-m3"  |  "Qwen/Qwen3-Embedding-8B"
-DEFAULT_MODEL = "BAAI/bge-m3"
+# [LOCAL-MODEL] Default local folder path for the embedding model.
+# Set this to wherever your IT/security team has placed the approved model files.
+# Do NOT use a Hugging Face repo name here — that would trigger a download.
+#
+# Examples:
+#   Windows : r"C:\approved_models\bge-m3"
+#   Linux   : "/opt/models/bge-m3"
+#
+# Override at runtime with:  --model /path/to/model
+DEFAULT_MODEL = r"C:\approved_models\bge-m3"
 
-# BGE-M3 max input tokens.  Chunks longer than this will be silently truncated
-# by the model tokenizer; log a warning so you know it happened.
-BGE_M3_MAX_TOKENS = 8192
+# [LOCAL-MODEL] Default model family.  Determines which FlagEmbedding class is used.
+#   "bge-m3"  → BGEM3FlagModel  (supports dense + sparse + ColBERT)
+#   "bge-v15" → FlagModel       (BGE v1.5 family: bge-base-en-v1.5, bge-large-en-v1.5)
+DEFAULT_MODEL_KIND = "bge-m3"
+
+# Max input tokens.  BGE-M3 supports up to 8192; BGE v1.5 supports 512.
+# load_model() sets this automatically based on model kind.
+BGE_M3_MAX_TOKENS  = 8192
+BGE_V15_MAX_TOKENS = 512
 
 # Minimum word count below which a chunk is considered too short to embed.
 # (chunker.py's RETRIEVAL_MIN_WORDS is 20; keep this consistent or tighter.)
@@ -296,42 +313,79 @@ def build_metadata(
 # 5.  Model loader  (swap-point for different embedding models)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_model(model_name: str = DEFAULT_MODEL, use_fp16: bool = True):
+def load_model(
+    model_name: str = DEFAULT_MODEL,
+    use_fp16: bool = True,
+    model_kind: str = DEFAULT_MODEL_KIND,   # [LOCAL-MODEL] "bge-m3" | "bge-v15"
+):
     """
-    Load the embedding model.
+    [LOCAL-MODEL] Load an embedding model from a LOCAL folder path.
 
-    ──────────────────────────────────────────────────────────────────
-    To benchmark a different model, change model_name:
+    model_name must be an absolute or relative path to a folder that
+    contains the model files (config.json, pytorch_model.bin / model.safetensors,
+    tokenizer files, etc.).  It must NOT be a Hugging Face repo name like
+    "BAAI/bge-m3" — that would attempt a network download.
 
-      BGE-M3 (default, multilingual, dense+sparse):
-        model_name = "BAAI/bge-m3"
-        from FlagEmbedding import BGEM3FlagModel
-        return BGEM3FlagModel(model_name, use_fp16=use_fp16)
+    model_kind selects the correct FlagEmbedding class:
+      "bge-m3"  → BGEM3FlagModel  supports dense + sparse + ColBERT output.
+                  Encode returns a dict: output["dense_vecs"] is the matrix.
+      "bge-v15" → FlagModel       for BGE v1.5 family (bge-base/large-en-v1.5).
+                  Encode returns a numpy array directly (no dict wrapper).
 
-      Qwen3-Embedding-8B (large, high quality):
-        model_name = "Qwen/Qwen3-Embedding-8B"
-        from FlagEmbedding import FlagModel
-        return FlagModel(model_name, use_fp16=use_fp16, ...)
+    The returned model object is tagged with a ._kind attribute so that
+    embed_texts() knows how to unpack the output without an extra argument.
 
-      OpenAI text-embedding-3-large (API, no local GPU):
-        import openai
-        return OpenAIEmbedder("text-embedding-3-large")
-    ──────────────────────────────────────────────────────────────────
+    Path validation:
+      Raises FileNotFoundError immediately if the local folder does not exist,
+      so you get a clear error instead of a cryptic download-attempt failure.
 
-    Returns a model object that must support:
-        model.encode(
-            sentences: list[str],
-            batch_size: int,
-            max_length: int,
-            return_dense: bool,
-        ) -> dict with key "dense_vecs": np.ndarray of shape (N, D)
+    To benchmark a different local model:
+      1. Copy the approved model files to your local folder.
+      2. Change DEFAULT_MODEL and DEFAULT_MODEL_KIND in the config section, or
+         pass --model /path/to/model --model-kind bge-v15 on the CLI.
     """
     if not _FLAG_AVAILABLE:
         raise ImportError("FlagEmbedding is not installed. Run: pip install FlagEmbedding")
 
-    print(f"[INFO] Loading model: {model_name}  (fp16={use_fp16})")
+    # [LOCAL-MODEL] Validate the local path before attempting to load.
+    model_path = Path(model_name)
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Local model folder not found: {model_path.resolve()}\n"
+            f"Place the model files in that folder, or pass --model /correct/path"
+        )
+    if not model_path.is_dir():
+        raise NotADirectoryError(
+            f"--model must point to a FOLDER containing model files, not a file: {model_path}"
+        )
+
+    kind = model_kind.lower().strip()
+    print(f"[INFO] Loading local model: {model_path.resolve()}")
+    print(f"[INFO] Model kind : {kind}  (fp16={use_fp16})")
     t0 = time.time()
-    model = BGEM3FlagModel(model_name, use_fp16=use_fp16)
+
+    if kind == "bge-m3":
+        # [LOCAL-MODEL] BGEM3FlagModel accepts a local folder path directly.
+        # Passing a folder path suppresses any Hugging Face Hub lookup.
+        model = BGEM3FlagModel(str(model_path), use_fp16=use_fp16)
+
+    elif kind == "bge-v15":
+        # [LOCAL-MODEL] FlagModel for BGE v1.5 family.
+        # query_instruction_for_retrieval is the BGE v1.5 recommended prefix.
+        model = FlagModel(
+            str(model_path),
+            query_instruction_for_retrieval="Represent this sentence for searching relevant passages: ",
+            use_fp16=use_fp16,
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown --model-kind {kind!r}.  "
+            f"Choose 'bge-m3' (BGEM3FlagModel) or 'bge-v15' (FlagModel)."
+        )
+
+    # [LOCAL-MODEL] Tag the model so embed_texts() can unpack output correctly.
+    model._kind = kind
     print(f"[INFO] Model loaded in {time.time() - t0:.1f}s")
     return model
 
@@ -340,39 +394,65 @@ def embed_texts(
     model,
     texts: list[str],
     batch_size: int = EMBED_BATCH_SIZE,
-    max_length: int = BGE_M3_MAX_TOKENS,
+    max_length: int | None = None,     # [LOCAL-MODEL] None → auto-select per model kind
 ) -> np.ndarray:
     """
     Generate dense embeddings for a list of texts using the loaded model.
 
     Returns np.ndarray of shape (len(texts), embedding_dim), dtype float32.
 
-    ── Extension point for sparse/hybrid retrieval ──
-    BGE-M3 also returns sparse weights (lexical scores per token) and
-    ColBERT multi-vector outputs.  To use them:
+    [LOCAL-MODEL] Output unpacking differs between model families:
+      bge-m3  → model.encode() returns a dict; vectors are in output["dense_vecs"]
+      bge-v15 → model.encode() returns a numpy array directly
+
+    The model._kind tag set by load_model() controls which path is taken,
+    so no extra argument is needed at the call site.
+
+    [LOCAL-MODEL] max_length defaults:
+      bge-m3  → BGE_M3_MAX_TOKENS  (8192)
+      bge-v15 → BGE_V15_MAX_TOKENS (512)
+    Passing an explicit max_length overrides the default for both families.
+
+    ── Extension point for sparse/hybrid retrieval (BGE-M3 only) ──
+    BGE-M3 also produces sparse weights and ColBERT multi-vectors:
         output = model.encode(..., return_sparse=True, return_colbert_vecs=True)
         sparse_weights = output["lexical_weights"]   # list of dicts
         colbert_vecs   = output["colbert_vecs"]      # list of np.ndarray
-    Add these to the metadata or a separate index for hybrid retrieval.
     """
-    # Warn about chunks likely to be truncated
+    # [LOCAL-MODEL] Pick the right token limit for each model family
+    kind = getattr(model, "_kind", "bge-m3")
+    if max_length is None:
+        max_length = BGE_V15_MAX_TOKENS if kind == "bge-v15" else BGE_M3_MAX_TOKENS
+
     long_texts = [t for t in texts if estimate_tokens(t) > max_length]
     if long_texts:
         print(f"[WARN] {len(long_texts)} texts may exceed {max_length} tokens and will be truncated.")
 
-    print(f"[INFO] Embedding {len(texts)} texts  (batch_size={batch_size}) …")
+    print(f"[INFO] Embedding {len(texts)} texts  (kind={kind}  batch_size={batch_size}  max_length={max_length}) …")
     t0 = time.time()
 
-    output = model.encode(
-        texts,
-        batch_size=batch_size,
-        max_length=max_length,
-        return_dense=True,
-        return_sparse=False,     # set True for hybrid retrieval later
-        return_colbert_vecs=False,
-    )
+    if kind == "bge-m3":
+        # [LOCAL-MODEL] BGE-M3 path: encode() returns a dict.
+        # return_sparse / return_colbert_vecs are False for dense-only mode.
+        output = model.encode(
+            texts,
+            batch_size=batch_size,
+            max_length=max_length,
+            return_dense=True,
+            return_sparse=False,      # flip to True for hybrid retrieval
+            return_colbert_vecs=False,
+        )
+        vectors = np.array(output["dense_vecs"], dtype=np.float32)
 
-    vectors = np.array(output["dense_vecs"], dtype=np.float32)
+    elif kind == "bge-v15":
+        # [LOCAL-MODEL] BGE v1.5 path: encode() returns a numpy array directly.
+        # batch_size is passed; max_length is set at model init level by FlagModel.
+        vectors = model.encode(texts, batch_size=batch_size)
+        vectors = np.array(vectors, dtype=np.float32)
+
+    else:
+        raise ValueError(f"Unknown model kind {kind!r} on loaded model object.")
+
     print(f"[INFO] Embedded {len(texts)} texts → shape {vectors.shape}  ({time.time()-t0:.1f}s)")
     return vectors
 
@@ -546,6 +626,7 @@ def run_index(
     title: str = "",
     doc_id: str = "",
     model_name: str = DEFAULT_MODEL,
+    model_kind: str = DEFAULT_MODEL_KIND,   # [LOCAL-MODEL]
     use_fp16: bool = True,
     batch_size: int = EMBED_BATCH_SIZE,
     index_type: str = FAISS_INDEX_TYPE,
@@ -608,7 +689,8 @@ def run_index(
         embed_text_list.append(et)
 
     # ── Step 4: Load model + embed ──
-    model = load_model(model_name, use_fp16=use_fp16)
+    # [LOCAL-MODEL] Pass model_kind so load_model picks the right class
+    model = load_model(model_name, use_fp16=use_fp16, model_kind=model_kind)
     vectors = embed_texts(model, embed_text_list, batch_size=batch_size)
 
     # ── Step 5: Normalise ──
@@ -641,11 +723,13 @@ def run_query(
     metadata_path: Path,
     top_k: int = 5,
     model_name: str = DEFAULT_MODEL,
+    model_kind: str = DEFAULT_MODEL_KIND,   # [LOCAL-MODEL]
     use_fp16: bool = True,
 ) -> list[dict]:
     """Load a saved index and run a single query."""
     index, metadata = load_index(index_path, metadata_path)
-    model = load_model(model_name, use_fp16=use_fp16)
+    # [LOCAL-MODEL] Forward model_kind so the correct class is used at query time
+    model = load_model(model_name, use_fp16=use_fp16, model_kind=model_kind)
     results = retrieve(query, model, index, metadata, top_k=top_k)
     print_results(results)
     return results
@@ -662,6 +746,7 @@ def _cli_index(args: argparse.Namespace) -> None:
         title            = args.title,
         doc_id           = args.doc_id or Path(args.input).stem,
         model_name       = args.model,
+        model_kind       = args.model_kind,   # [LOCAL-MODEL]
         use_fp16         = not args.no_fp16,
         batch_size       = args.batch_size,
         index_type       = args.index_type,
@@ -675,6 +760,7 @@ def _cli_query(args: argparse.Namespace) -> None:
         metadata_path = Path(args.metadata),
         top_k         = args.topk,
         model_name    = args.model,
+        model_kind    = args.model_kind,   # [LOCAL-MODEL]
         use_fp16      = not args.no_fp16,
     )
 
@@ -697,7 +783,12 @@ def main() -> None:
     idx.add_argument("--doc-id",     default="",
                      help="Document identifier (default: input filename stem)")
     idx.add_argument("--model",      "-m", default=DEFAULT_MODEL,
-                     help=f"Embedding model (default: {DEFAULT_MODEL})")
+                     # [LOCAL-MODEL] Must be a local folder path, not a HF repo name
+                     help=f"Local model folder path (default: {DEFAULT_MODEL})")
+    idx.add_argument("--model-kind", default=DEFAULT_MODEL_KIND,
+                     choices=["bge-m3", "bge-v15"],
+                     # [LOCAL-MODEL] Selects BGEM3FlagModel vs FlagModel
+                     help=f"Model family (default: {DEFAULT_MODEL_KIND})")
     idx.add_argument("--no-fp16",    action="store_true",
                      help="Disable fp16 (use if model errors on your hardware)")
     idx.add_argument("--batch-size", type=int, default=EMBED_BATCH_SIZE,
@@ -713,7 +804,12 @@ def main() -> None:
     qry.add_argument("--query",    "-q", required=True, help="Query string")
     qry.add_argument("--topk",     "-k", type=int, default=5,
                      help="Number of results to return (default: 5)")
-    qry.add_argument("--model",    "-m", default=DEFAULT_MODEL)
+    qry.add_argument("--model",      "-m", default=DEFAULT_MODEL,
+                     # [LOCAL-MODEL] local folder path
+                     help=f"Local model folder path (default: {DEFAULT_MODEL})")
+    qry.add_argument("--model-kind", default=DEFAULT_MODEL_KIND,
+                     choices=["bge-m3", "bge-v15"],
+                     help=f"Model family (default: {DEFAULT_MODEL_KIND})")
     qry.add_argument("--no-fp16",  action="store_true")
 
     args = parser.parse_args()
